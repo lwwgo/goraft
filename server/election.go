@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"log"
 	"math/rand"
 	"net"
@@ -12,18 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-type Peer struct {
-	Addr string
-}
-
-func (p Peer) Empty() bool {
-	return reflect.DeepEqual(p, Peer{})
-}
-
-func (p Peer) Equal(x Peer) bool {
-	return p.Addr == x.Addr
-}
 
 type CMState int
 
@@ -45,8 +34,50 @@ func (s CMState) String() string {
 	case Dead:
 		return "dead"
 	default:
+		return "unreachable"
+	}
+}
+
+type MessageType int
+
+const (
+	MsgVote MessageType = iota
+	MsgVoteResp
+	MsgHeartbeat
+	MsgHeartbeatResp
+	MsgAppendLog
+	MsgAppendLogResp
+)
+
+func (mt MessageType) String() string {
+	switch mt {
+	case MsgVote:
+		return "msgVote"
+	case MsgVoteResp:
+		return "msgVoteResp"
+	case MsgHeartbeat:
+		return "msgHeartBeat"
+	case MsgHeartbeatResp:
+		return "msgHeartbeatResp"
+	case MsgAppendLog:
+		return "msgAppendLog"
+	case MsgAppendLogResp:
+		return "msgAppendLogResp"
+	default:
 		return "unsupported"
 	}
+}
+
+type Peer struct {
+	Addr string
+}
+
+func (p Peer) Empty() bool {
+	return reflect.DeepEqual(p, Peer{})
+}
+
+func (p Peer) Equal(x Peer) bool {
+	return p.Addr == x.Addr
 }
 
 type CommandEtnry struct {
@@ -56,7 +87,8 @@ type CommandEtnry struct {
 
 type LogEntry struct {
 	Command CommandEtnry
-	Term    int
+	Term    uint64
+	Index   uint64
 }
 
 type Server struct {
@@ -66,20 +98,19 @@ type Server struct {
 	Peers []Peer
 
 	// 每个Server既是服务器端, 也是客户端.
-	// server接受其他Server的请求, client向其他Server发送请求
-	RpcServer  *rpc.Server
-	RpcClients map[string]*rpc.Client
+	// server接受其他Server的请求
+	RpcServer *rpc.Server
 
 	// 状态
 	State CMState
 	// 节点所处的任期
-	Term int
+	Term uint64
 	// 节点上内存态的命令日志, 待刷入持久化存储
 	Logs []LogEntry
 	// 投票支持的节点. 空：未投票
 	VotedFor Peer
 	// 已提交的最新日志编号
-	CommitIndex int
+	CommittedIndex uint64
 	// 选举超时时间, 开始时间. 每次超时检测完成后, 重置
 	ElectionTimeStart time.Time
 	// 超时时间间隔, now - ElectionTimeStart > TimeOut, 节点开始发起选举投票
@@ -89,26 +120,30 @@ type Server struct {
 	// 节点状态锁
 	MuLock sync.Mutex
 
+	// 业务状态机处理回调函数
+	bizApplyFunc func(logEntry *LogEntry) error
+
 	// ************* leader 仅有的字段 *******
 	// leader记录其他每个Server应该接受的下个日志编号
-	NextIndex map[string]int
+	NextIndex map[string]uint64
 }
 
 // 投票请求
 type RequestVote struct {
+	Type MessageType
 	// 发起投票请求节点的当前任期号
-	Term        int
+	Term        uint64
 	CandidateID Peer
 	// 发起投票节点在日志中的最后任期号
-	Lastterm int
+	LastTerm uint64
 	// 发起投票节点在日志中的最后编号
-	LastIndex int
+	LastIndex uint64
 }
 
 // 投票响应
 type ResponseVote struct {
 	// 接收节点所在的任期
-	Term int
+	Term uint64
 	// true: 赞成; false: 反对
 	VoteGranted bool
 }
@@ -121,24 +156,23 @@ func InitServer(addr string, peerAddrs []string) (*Server, error) {
 	s := &Server{
 		LocalID:             Peer{Addr: addr},
 		Peers:               peers,
-		RpcClients:          make(map[string]*rpc.Client, len(peers)),
 		State:               Follower,
 		Term:                0,
-		Logs:                make([]LogEntry, 1),
+		Logs:                make([]LogEntry, 0),
 		VotedFor:            Peer{},
-		CommitIndex:         0,
+		CommittedIndex:      0,
 		ElectionTimeStart:   time.Now(),
 		TimeOut:             10 * time.Second,
 		TimeOutRandomFactor: 0.1,
-		NextIndex:           make(map[string]int, len(peers)),
+		NextIndex:           make(map[string]uint64, len(peers)),
+		bizApplyFunc: func(logEntry *LogEntry) error {
+			log.Printf("bussines state machine apply succ")
+			return nil
+		},
 	}
-	s.Logs[0] = LogEntry{
-		Command: CommandEtnry{Op: "log-head", Size: -1},
-		// 0 是一个不会出现在真是任期的任期号, 真实任期从1开始标号.
-		Term: 0,
-	}
+
 	for _, peer := range peers {
-		s.NextIndex[peer.Addr] = len(s.Logs)
+		s.NextIndex[peer.Addr] = uint64(len(s.Logs))
 	}
 	log.Printf("after init server, nextIndex: %+v\n", s.NextIndex)
 
@@ -157,15 +191,6 @@ func InitServer(addr string, peerAddrs []string) (*Server, error) {
 		}
 	}()
 
-	for _, peer := range peers {
-		if _, ok := s.RpcClients[peer.Addr]; !ok {
-			client, err := rpc.Dial("tcp", peer.Addr)
-			if err != nil {
-				panic(err)
-			}
-			s.RpcClients[peer.Addr] = client
-		}
-	}
 	return s, nil
 }
 
@@ -174,7 +199,12 @@ func (nd *Server) Addr() string {
 }
 
 func (nd *Server) VoteHandler(req RequestVote, resp *ResponseVote) error {
+	if req.Type != MsgVote {
+		log.Printf("do not support request message type, msgType:%s\n", req.Type.String())
+		return errors.New("message type not supported")
+	}
 	log.Printf("receive vote request:%+v\n", req)
+
 	nd.MuLock.Lock()
 	defer nd.MuLock.Unlock()
 
@@ -187,9 +217,8 @@ func (nd *Server) VoteHandler(req RequestVote, resp *ResponseVote) error {
 	// 如果两份日志最后条目的任期号相同，那么日志较长的那个更新。
 	if req.Term > nd.Term &&
 		(nd.VotedFor.Empty() || nd.VotedFor.Equal(req.CandidateID)) &&
-		(req.Lastterm > LastTerm || (req.Lastterm == LastTerm && req.LastIndex >= lastIndex)) {
-		log.Printf("receive vote request from %s, Server[%s] change state from %s to %s\n",
-			req.CandidateID, nd.LocalID, nd.State.String(), Follower.String())
+		(req.LastTerm > LastTerm || (req.LastTerm == LastTerm && req.LastIndex >= lastIndex)) {
+		log.Printf("receive vote request from %s, change state from %s to %s\n", req.CandidateID.Addr, nd.State.String(), Follower.String())
 		nd.State = Follower
 		nd.Term = req.Term
 		nd.VotedFor = req.CandidateID
@@ -205,10 +234,11 @@ func (nd *Server) Elect() {
 	var wg sync.WaitGroup
 	winCount := int64(1)
 	request := RequestVote{
+		Type:        MsgVote,
 		Term:        nd.Term,
 		CandidateID: nd.LocalID,
 		LastIndex:   nd.getLogIndex(),
-		Lastterm:    nd.getLogTerm(),
+		LastTerm:    nd.getLogTerm(),
 	}
 	for _, peer := range nd.Peers {
 		if nd.State != Candidate {
@@ -219,7 +249,7 @@ func (nd *Server) Elect() {
 		go func(peer Peer) {
 			defer wg.Done()
 			response := &ResponseVote{}
-			err := util.RpcCallTimeout(nd.RpcClients[peer.Addr], "Server.VoteHandler", request, response, 2*time.Second)
+			err := util.RpcCallTimeout(peer.Addr, "Server.VoteHandler", request, response, 2*time.Second)
 			if err != nil {
 				log.Printf("rpc client send request failed, err:%s\n", err.Error())
 			}
@@ -233,9 +263,8 @@ func (nd *Server) Elect() {
 				// 成为主节点
 				nd.MuLock.Lock()
 				nd.State = Leader
-				nd.VotedFor = Peer{}
 				nd.MuLock.Unlock()
-				log.Printf("Server[%s] won the election, become to be leader, winCount:%d, sum:%d\n", nd.LocalID.Addr, winCount, len(nd.Peers)+1)
+				log.Printf("server[%s] won the election, become to be leader, winCount:%d, sum:%d\n", nd.LocalID.Addr, winCount, len(nd.Peers)+1)
 
 				// 通过心跳, 通知其他从节点结束本轮选举
 				nd.SendHeartbeat()
@@ -246,7 +275,14 @@ func (nd *Server) Elect() {
 
 	wg.Wait()
 	if int(winCount*2) <= len(nd.Peers)+1 {
-		log.Printf("Server[%s] lost the election, winCount:%d, sum:%d\n", nd.LocalID.Addr, winCount, len(nd.Peers)+1)
+		if nd.State == Candidate {
+			nd.MuLock.Lock()
+			if nd.State == Candidate {
+				nd.VotedFor = Peer{}
+			}
+			nd.MuLock.Unlock()
+		}
+		log.Printf("server[%s] lost the election, winCount:%d, sum:%d\n", nd.LocalID.Addr, winCount, len(nd.Peers)+1)
 	}
 }
 
@@ -269,6 +305,7 @@ func (nd *Server) RunElectionTimer() {
 
 		if time.Since(nd.ElectionTimeStart) >= nd.timeOutInternal() {
 			// 选举超时, 成为候选节点, 首先增加任期号, 并投自己一票
+			oldState := nd.State
 			nd.MuLock.Lock()
 			nd.State = Candidate
 			nd.Term++
@@ -277,21 +314,21 @@ func (nd *Server) RunElectionTimer() {
 			nd.MuLock.Unlock()
 
 			// 向其他节点发起选举请求
-			log.Printf("Server[%s] began to launch an election\n", nd.LocalID.Addr)
+			log.Printf("change state from %s to %s, began to launch an election\n", oldState.String(), Candidate.String())
 			nd.Elect()
-			log.Printf("the election Server[%s] initiated is over\n", nd.LocalID.Addr)
+			log.Printf("the election server[%s] initiated is over\n", nd.LocalID.Addr)
 		}
 	}
 }
 
-func (nd *Server) getLogIndex() int {
+func (nd *Server) getLogIndex() uint64 {
 	if len(nd.Logs) == 0 {
-		return -1
+		return 0
 	}
-	return len(nd.Logs) - 1
+	return uint64(len(nd.Logs)) - 1
 }
 
-func (nd *Server) getLogTerm() int {
+func (nd *Server) getLogTerm() uint64 {
 	if len(nd.Logs) == 0 {
 		return 0
 	}
@@ -307,6 +344,7 @@ func (s *Server) SendHeartbeat() {
 
 	log.Printf("leader[%s] start to send heartbeat\n", s.LocalID.Addr)
 	requestAppend := &RequestAppend{
+		Type:        MsgHeartbeat,
 		Term:        s.Term,
 		LeaderID:    s.LocalID,
 		PreLogIndex: s.getLogIndex(),
@@ -315,7 +353,7 @@ func (s *Server) SendHeartbeat() {
 	for _, peer := range s.Peers {
 		go func(peer Peer) {
 			responseAppend := &ResponseAppend{}
-			if err := s.RpcClients[peer.Addr].Call("Server.AppendEntryHandler", requestAppend, responseAppend); err != nil {
+			if err := util.RpcCallTimeout(peer.Addr, "Server.AppendEntryHandler", requestAppend, responseAppend, 2*time.Second); err != nil {
 				log.Printf("send heartbeat failed, from %s to %s\n", s.LocalID.Addr, peer.Addr)
 			}
 		}(peer)
@@ -359,7 +397,7 @@ func (nd *Server) Run() {
 		log.Printf("this node is %s\n", nd.State.String())
 		if nd.State == Leader {
 			for i := 0; i < 100; i++ {
-				nd.WriteLog(CommandEtnry{Op: "write raft log test", Size: i})
+				nd.Do(CommandEtnry{Op: "write raft log test", Size: i})
 				time.Sleep(5 * time.Second)
 			}
 		}

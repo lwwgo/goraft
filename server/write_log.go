@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"log"
 	"raft/util"
 	"runtime"
@@ -10,67 +11,80 @@ import (
 
 // 复制日志rpc请求
 type RequestAppend struct {
-	Term         int
-	LeaderID     Peer
-	PreLogIndex  int
-	PreLogTerm   int
-	Entries      []LogEntry
-	LeaderCommit int
+	Type            MessageType
+	Term            uint64
+	LeaderID        Peer
+	PreLogIndex     uint64
+	PreLogTerm      uint64
+	Entries         []LogEntry
+	LeaderCommitted uint64
 }
 
 // 复制日志rpc响应
 type ResponseAppend struct {
-	Term    int
+	Term    uint64
 	Success bool
 }
 
 func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) error {
-	log.Printf("Server[%s] receive append log entry request from %s, local log lenght:%d, appendEntry lenght:%d, logs:%+v, req:%+v, local server logs:%+v\n",
-		s.LocalID.Addr, req.LeaderID.Addr, len(s.Logs), len(req.Entries), req.Entries, *req, s.Logs)
+	log.Printf("receive %s request from %s, local log lenght:%d, appendEntry lenght:%d, logs:%+v, req:%+v, local server logs:%+v\n",
+		req.Type.String(), req.LeaderID.Addr, len(s.Logs), len(req.Entries), req.Entries, *req, s.Logs)
 	// 接收主节点广播选举结果, 本节点主动变为从
 	// 在等待投票期间，candidate 可能会收到另一个声称自己是 leader 的服务器节点发来的 AppendEntries RPC
 	// 如果这个 leader 的任期号（包含在RPC中）不小于 candidate 当前的任期号，那么 candidate 会承认该 leader 的合法地位并回到 follower 状态
 	// 如果 RPC 中的任期号比自己的小，那么 candidate 就会拒绝这次的 RPC 并且继续保持 candidate 状态
-	if len(req.Entries) == 0 && req.Term >= s.Term {
+	if req.Type == MsgHeartbeat && req.Term >= s.Term {
 		s.MuLock.Lock()
 		if s.State != Follower {
-			log.Printf("receive append empty log-entry from leader[%s], Server[%s] change state from %s to %s\n",
-				req.LeaderID, s.LocalID, s.State.String(), Follower.String())
+			log.Printf("change state from %s to %s\n", s.State.String(), Follower.String())
 			s.State = Follower
-			s.VotedFor = Peer{}
+			s.VotedFor = req.LeaderID
 		}
 		// 正常接收心跳, 则重置选举超时时间
 		s.ElectionTimeStart = time.Now()
+		// 提交本地日志, 与leader保持提交一致
+		if req.LeaderCommitted > s.CommittedIndex {
+			s.CommittedIndex = util.Min(uint64(len(s.Logs)-1), req.LeaderCommitted)
+		}
 		s.MuLock.Unlock()
 		return nil
 	}
 
 	resp.Success = false
-	// 同步日志, 一致性检查保证跟随者日志和领导者日志相同(已提交日志)
-	if req.PreLogIndex == len(s.Logs)-1 && req.PreLogTerm == s.Logs[req.PreLogIndex].Term {
-		s.Logs = append(s.Logs, req.Entries...)
-		resp.Success = true
-		log.Printf("append log entry succ, logs:%+v\n", s.Logs)
-	} else {
-		// 清理不一致日志
-		s.Logs = s.Logs[:len(s.Logs)-1]
+	if req.Type == MsgAppendLog {
+		// 同步日志, 一致性检查保证跟随者日志和领导者日志相同(已提交日志)
+		if (req.PreLogIndex == 0 && req.LeaderCommitted == 0) ||
+			(req.PreLogIndex == uint64(len(s.Logs)-1) && req.PreLogTerm == s.Logs[req.PreLogIndex].Term) {
+			// 1. 写本地内存
+			s.Logs = append(s.Logs, req.Entries...)
+			// 2. todo 写本地wal
+
+			// 3. 在下一次心跳中检查leader committedIndex, 在心跳中提交历史上leader已提交的日志
+
+			resp.Success = true
+			log.Printf("append log entry succ, log:%+v\n", req.Entries)
+		} else {
+			// 清理不一致日志
+			s.Logs = s.Logs[:len(s.Logs)-1]
+		}
 	}
-	s.CommitIndex = len(s.Logs) - 1
+
 	return nil
 }
 
-func (s *Server) findConsistencyPoint(peer Peer) int {
+func (s *Server) findConsistencyPoint(peer Peer) uint64 {
+	preLogTerm, preLogIndex := s.peerPreTermAndIndex(peer)
 	logIndex := s.NextIndex[peer.Addr]
 	requestAppend := &RequestAppend{
 		Term:        s.Term,
 		LeaderID:    s.LocalID,
-		PreLogIndex: logIndex - 1,
-		PreLogTerm:  s.Logs[logIndex-1].Term,
+		PreLogIndex: preLogIndex,
+		PreLogTerm:  preLogTerm,
 		Entries:     []LogEntry{s.Logs[logIndex]},
 	}
 
 	responseAppend := &ResponseAppend{}
-	err := s.RpcClients[peer.Addr].Call("Server.AppendEntryHandler", requestAppend, responseAppend)
+	err := util.RpcCallTimeout(peer.Addr, "Server.AppendEntryHandler", requestAppend, responseAppend, 2*time.Second)
 	if err != nil {
 		log.Printf("repair log failed from leader[%s] to follower[%s]\n", s.LocalID.Addr, peer.Addr)
 	} else if !responseAppend.Success {
@@ -84,9 +98,10 @@ func (s *Server) findConsistencyPoint(peer Peer) int {
 func (s *Server) repairLog(peer Peer) bool {
 	cPoint := s.findConsistencyPoint(peer)
 
-	for logIndex := cPoint + 1; logIndex < len(s.Logs); logIndex++ {
+	for logIndex := cPoint + 1; logIndex < uint64(len(s.Logs)); logIndex++ {
 		logIndex := s.NextIndex[peer.Addr]
 		requestAppend := &RequestAppend{
+			Type:        MsgAppendLog,
 			Term:        s.Term,
 			LeaderID:    s.LocalID,
 			PreLogIndex: logIndex - 1,
@@ -95,7 +110,7 @@ func (s *Server) repairLog(peer Peer) bool {
 		}
 
 		responseAppend := &ResponseAppend{}
-		err := s.RpcClients[peer.Addr].Call("Server.AppendEntryHandler", requestAppend, responseAppend)
+		err := util.RpcCallTimeout(peer.Addr, "Server.AppendEntryHandler", requestAppend, responseAppend, 2*time.Second)
 		if err != nil || !responseAppend.Success {
 			log.Printf("repair log failed from leader[%s] to follower[%s]\n", s.LocalID.Addr, peer.Addr)
 			return false
@@ -108,40 +123,40 @@ func (s *Server) repairLog(peer Peer) bool {
 }
 
 // leader 向 follower 复制日志
-func (s *Server) WriteLog(command CommandEtnry) (*LogEntry, bool) {
+func (s *Server) WriteLog(command CommandEtnry) *LogEntry {
 	logEntry := LogEntry{
 		Command: command,
 		Term:    s.Term,
 	}
-	// 写本节点
+	// 1. 写本节点内存
 	s.MuLock.Lock()
 	s.Logs = append(s.Logs, logEntry)
+	currentIndex := int64(len(s.Logs) - 1)
 	s.MuLock.Unlock()
+	// 2. todo 写本地wal
+
 	// 本节点已经写入, 成功数量起始值应为 1
 	succ := 1
 	log.Printf("leader write log, logEntry:%+v\n", logEntry)
 
-	// 并发写其他节点
+	// 3. 并发写其他节点
 	var wg sync.WaitGroup
 	for _, peer := range s.Peers {
 		wg.Add(1)
 		go func(peer Peer) {
 			defer wg.Done()
 			log.Printf("server nextIndex: %+v\n", s.NextIndex)
-			preLogIndex, preLogTerm := s.NextIndex[peer.Addr]-1, 0
-			if preLogIndex >= 0 {
-				preLogTerm = s.Logs[preLogIndex].Term
-			}
+			preLogTerm, preLogIndex := s.peerPreTermAndIndex(peer)
 			requestAppend := RequestAppend{
-				Term:         s.Term,
-				LeaderID:     s.LocalID,
-				PreLogIndex:  preLogIndex,
-				PreLogTerm:   preLogTerm,
-				Entries:      []LogEntry{logEntry},
-				LeaderCommit: s.CommitIndex,
+				Type:            MsgAppendLog,
+				Term:            s.Term,
+				LeaderID:        s.LocalID,
+				PreLogIndex:     preLogIndex,
+				PreLogTerm:      preLogTerm,
+				Entries:         []LogEntry{logEntry},
+				LeaderCommitted: s.CommittedIndex,
 			}
 
-			responseAppend := &ResponseAppend{}
 			defer func() {
 				if r := recover(); r != nil {
 					buff := make([]byte, 1<<10)
@@ -149,16 +164,22 @@ func (s *Server) WriteLog(command CommandEtnry) (*LogEntry, bool) {
 					log.Printf("recover info: %v %v\n", r, string(buff))
 				}
 			}()
-			log.Printf("start to write log, origin:%s, dest:%s, requestAppend:%+v\n", s.LocalID.Addr, peer.Addr, requestAppend)
-			err := util.RpcCallTimeout(s.RpcClients[peer.Addr], "Server.AppendEntryHandler", requestAppend, responseAppend, 1*time.Second)
+
+			responseAppend := &ResponseAppend{}
+			log.Printf("start to write log, origin:%s, dest:%s, req:%+v\n", s.LocalID.Addr, peer.Addr, requestAppend)
+			err := util.RpcCallTimeout(peer.Addr, "Server.AppendEntryHandler", requestAppend, responseAppend, 1*time.Second)
 			if err != nil {
-				log.Printf("write log failed from leader[%s] to follower[%s], err:%s\n", s.LocalID.Addr, peer.Addr, err.Error())
+				log.Printf("write log replica failed to follower[%s], err:%s\n", peer.Addr, err.Error())
 			} else if responseAppend.Success {
 				succ++
 				s.NextIndex[peer.Addr]++
 				log.Printf("write log succ on dest:%s\n", peer.Addr)
 			} else if !responseAppend.Success {
-				s.NextIndex[peer.Addr] = requestAppend.PreLogIndex - 1
+				if requestAppend.PreLogIndex > 0 {
+					s.NextIndex[peer.Addr] = requestAppend.PreLogIndex - 1
+				} else {
+					s.NextIndex[peer.Addr] = 0
+				}
 				// follower 追 leader 的日志
 				repairSucc := s.repairLog(peer)
 				if repairSucc {
@@ -169,17 +190,45 @@ func (s *Server) WriteLog(command CommandEtnry) (*LogEntry, bool) {
 	}
 	wg.Wait()
 
-	// leader 标记日志为 [已提交]
+	// 4. 复制日志成功, leader 标记日志为 [已提交]; 否则, 回滚本地内存
 	if succ*2 > len(s.Peers)+1 {
 		s.MuLock.Lock()
-		s.CommitIndex++
+		s.incCommitedIndex()
 		s.MuLock.Unlock()
-		log.Printf("write %d replica log succ\n", succ)
-		return &logEntry, true
+		log.Printf("write %d log-replicas succ, it is committed\n", succ)
+		return &logEntry
 	}
-	return nil, false
+	s.MuLock.Lock()
+	s.Logs = append(s.Logs[:currentIndex], s.Logs[currentIndex+1:]...)
+	s.MuLock.Unlock()
+	return nil
 }
 
-func (s *Server) ApplyLog(logEntry *LogEntry) bool {
-	return true
+func (s *Server) incCommitedIndex() {
+	if s.CommittedIndex == 0 && len(s.Logs) == 1 {
+		s.CommittedIndex = 0
+	} else {
+		s.CommittedIndex++
+	}
+}
+
+func (s *Server) peerPreTermAndIndex(peer Peer) (uint64, uint64) {
+	next := s.NextIndex[peer.Addr]
+	if next == 0 {
+		return 0, 0
+	}
+	return s.Logs[next-1].Term, next - 1
+}
+
+func (s *Server) Do(command CommandEtnry) error {
+	logEntry := s.WriteLog(command)
+	if logEntry != nil {
+		return errors.New("write log replica failed\n")
+	}
+	err := s.bizApplyFunc(logEntry)
+	if err != nil {
+		log.Printf("apply log to bussines state machine failed, log:%+v\n", *logEntry)
+		return errors.New("apply log to bussines state machine failed")
+	}
+	return nil
 }
