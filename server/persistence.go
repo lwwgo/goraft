@@ -1,4 +1,4 @@
-package server
+package raftserver
 
 type Persistence struct {
 	Term  uint64

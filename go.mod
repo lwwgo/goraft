@@ -1,4 +1,4 @@
-module raft
+module github.com/lwwgo/goraft
 
 go 1.18
 
