@@ -1,5 +1,7 @@
+.vscode/*
 # Log for project
 log/*
+wal*
 # Binaries for programs and plugins
 *.exe
 *.exe~

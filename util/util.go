@@ -2,8 +2,10 @@ package util
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/rpc"
+	"os"
 	"time"
 )
 
@@ -41,10 +43,13 @@ func RpcCallTimeout(addr, serviceMethod string, args any, reply any, timeout tim
 	} else {
 		select {
 		case <-time.After(timeout):
+			log.Printf("timeout, outParams after call args:%+v, reply:%+v\n", args, reply)
 			return RpcTimeoutErr
 		case <-done:
+			log.Printf("done, outParams after call args:%+v, reply:%+v\n", args, reply)
 			return nil
 		case <-fail:
+			log.Printf("fail, outParams after call args:%+v, reply:%+v\n", args, reply)
 			return err
 		}
 	}
@@ -62,4 +67,19 @@ func Max[T int | int64 | uint64 | float64](a, b T) T {
 		return a
 	}
 	return b
+}
+
+func PathIsExist(path string) bool {
+	_, err := os.Stat(path)
+	if err != nil {
+		if os.IsExist(err) {
+			return true
+		}
+		if os.IsNotExist(err) {
+			return false
+		}
+		fmt.Println(err)
+		return false
+	}
+	return true
 }

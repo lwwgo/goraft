@@ -5,14 +5,15 @@ import (
 	"io"
 	"log"
 	"os"
-	"raft/server"
 
+	"github.com/lwwgo/goraft/server"
 	"github.com/spf13/viper"
 )
 
 type Config struct {
 	LocalID string   `toml:"localID"`
 	Peers   []string `toml:"peers"`
+	WalDir  string   `toml:"walDir"`
 }
 
 func main() {
@@ -48,7 +49,7 @@ func main() {
 	log.Printf("config %+v\n", config)
 
 	log.Printf("start raft clueter!\n")
-	rfNode, err := server.InitServer(config.LocalID, config.Peers)
+	rfNode, err := server.InitServer(config.LocalID, config.Peers, config.WalDir)
 	if err != nil {
 		panic(err)
 	}

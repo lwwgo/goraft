@@ -1,17 +1,22 @@
-package raftserver
+package server
 
 import (
 	"errors"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
 	"net/rpc"
-	"raft/util"
+	"os"
+	"path"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lwwgo/goraft/util"
 )
 
 type CMState int
@@ -111,6 +116,8 @@ type Server struct {
 	VotedFor Peer
 	// 已提交的最新日志编号
 	CommittedIndex uint64
+	// 已应用到业务逻辑状态机中的最新日志索引
+	AppliedIndex uint64
 	// 选举超时时间, 开始时间. 每次超时检测完成后, 重置
 	ElectionTimeStart time.Time
 	// 超时时间间隔, now - ElectionTimeStart > TimeOut, 节点开始发起选举投票
@@ -120,8 +127,10 @@ type Server struct {
 	// 节点状态锁
 	MuLock sync.Mutex
 
+	// 持久化存储
+	Persist *Persistence
 	// 业务状态机处理回调函数
-	bizApplyFunc func(logEntry *LogEntry) error
+	bizApplyFunc func(logEntry LogEntry) error
 
 	// ************* leader 仅有的字段 *******
 	// leader记录其他每个Server应该接受的下个日志编号
@@ -148,7 +157,7 @@ type ResponseVote struct {
 	VoteGranted bool
 }
 
-func InitServer(addr string, peerAddrs []string) (*Server, error) {
+func InitServer(addr string, peerAddrs []string, walWorkPath string) (*Server, error) {
 	peers := make([]Peer, 0)
 	for _, addr := range peerAddrs {
 		peers = append(peers, Peer{Addr: addr})
@@ -161,14 +170,47 @@ func InitServer(addr string, peerAddrs []string) (*Server, error) {
 		Logs:                make([]LogEntry, 0),
 		VotedFor:            Peer{},
 		CommittedIndex:      0,
+		AppliedIndex:        0,
 		ElectionTimeStart:   time.Now(),
 		TimeOut:             10 * time.Second,
 		TimeOutRandomFactor: 0.1,
 		NextIndex:           make(map[string]uint64, len(peers)),
-		bizApplyFunc: func(logEntry *LogEntry) error {
+		Persist:             NewPersistence(0, 0, walWorkPath),
+		bizApplyFunc: func(logEntry LogEntry) error {
 			log.Printf("bussines state machine apply succ")
 			return nil
 		},
+	}
+	// 加载wal到内存
+	if isExist := util.PathIsExist(s.Persist.WorkPath); isExist {
+		files, err := ioutil.ReadDir(s.Persist.WorkPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, fileInfo := range files {
+			if fileInfo.IsDir() {
+				continue
+			}
+			filepath := path.Join(s.Persist.WorkPath, fileInfo.Name())
+			if strings.Contains(fileInfo.Name(), ".wal") {
+				logEntries, err := s.Persist.Load(filepath)
+				if err != nil {
+					return nil, err
+				}
+				s.Logs = append(s.Logs, logEntries...)
+				log.Printf("reload wal file:%s succ, length of logs:%d\n", filepath, len(s.Logs))
+				s.Term = util.Max(s.Term, s.Logs[len(s.Logs)-1].Term)
+				os.Remove(filepath)
+			}
+		}
+	} else {
+		log.Printf("%s does not exist, mkdir it\n", s.Persist.WorkPath)
+		os.Mkdir(s.Persist.WorkPath, os.ModePerm)
+	}
+	if len(s.Logs) > 0 {
+		s.Persist.Term = s.Logs[len(s.Logs)-1].Term
+		s.Persist.Index = s.Logs[len(s.Logs)-1].Index
+		s.Persist.SetPath()
 	}
 
 	for _, peer := range peers {
@@ -256,10 +298,10 @@ func (nd *Server) Elect() {
 			if response.VoteGranted {
 				atomic.AddInt64(&winCount, 1)
 			} else {
-				log.Printf("vote request failed, voteGranted:%v, \n", response.VoteGranted)
+				log.Printf("vote request failed from %s, voteGranted:%v\n", peer.Addr, response.VoteGranted)
 			}
 			// 选票超过集群中节点数量的一半, 则当选
-			if int(winCount*2) > len(nd.Peers)+1 {
+			if nd.State != Leader && int(winCount*2) > len(nd.Peers)+1 {
 				// 成为主节点
 				nd.MuLock.Lock()
 				nd.State = Leader
@@ -344,11 +386,12 @@ func (s *Server) SendHeartbeat() {
 
 	log.Printf("leader[%s] start to send heartbeat\n", s.LocalID.Addr)
 	requestAppend := &RequestAppend{
-		Type:        MsgHeartbeat,
-		Term:        s.Term,
-		LeaderID:    s.LocalID,
-		PreLogIndex: s.getLogIndex(),
-		PreLogTerm:  s.getLogTerm(),
+		Type:            MsgHeartbeat,
+		Term:            s.Term,
+		LeaderID:        s.LocalID,
+		PreLogIndex:     s.getLogIndex(),
+		PreLogTerm:      s.getLogTerm(),
+		LeaderCommitted: s.CommittedIndex,
 	}
 	for _, peer := range s.Peers {
 		go func(peer Peer) {
@@ -387,6 +430,7 @@ func (nd *Server) Run() {
 	go func() {
 		defer wg.Done()
 		nd.RunHeartbeatTimer()
+		log.Printf("exist heartbeat loop\n")
 	}()
 
 	// 测试
