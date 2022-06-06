@@ -1,9 +1,11 @@
 localID = "127.0.0.1:1231"
+isLearner = true
 
 peers = ["127.0.0.1:1231"]
 
-learner = "127.0.0.1:1232"
+learner = "127.0.0.1:1231"
 
 walDir = "wal"
 
 snapDir = "snapshot"
+maxIndexSpan = 10000

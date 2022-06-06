@@ -46,7 +46,7 @@ func (p *Persistence) Append(logEntry *LogEntry) error {
 }
 
 // Load 加载磁盘文件到内存
-func (p *Persistence) Load(filePath string) ([]LogEntry, error) {
+func (p *Persistence) Load(filePath string, startIndex uint64) ([]LogEntry, error) {
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		log.Printf("open file failed, err:%s\n", err.Error())
@@ -58,7 +58,7 @@ func (p *Persistence) Load(filePath string) ([]LogEntry, error) {
 	logEntry := &LogEntry{}
 	for err == nil {
 		err = decoder.Decode(logEntry)
-		if err == nil {
+		if err == nil && logEntry.Index > startIndex {
 			LogEntries = append(LogEntries, *logEntry)
 			log.Printf("decode result: %+v\n", *logEntry)
 		}

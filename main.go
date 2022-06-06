@@ -10,14 +10,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-type Config struct {
-	LocalID string   `toml:"localID"`
-	Peers   []string `toml:"peers"`
-	Learner string   `toml:"learner"`
-	WalDir  string   `toml:"walDir"`
-	SnapDir string   `toml:"snapDir"`
-}
-
 func main() {
 	configName := flag.String("c", "conf.toml", "conf")
 	flag.Parse()
@@ -32,7 +24,7 @@ func main() {
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
-	var config Config
+	var config server.Config
 	curPath, err := os.Getwd()
 	if err != nil {
 		return
@@ -51,7 +43,7 @@ func main() {
 	log.Printf("config %+v\n", config)
 
 	log.Printf("start raft clueter!\n")
-	rfNode, err := server.InitServer(config.LocalID, config.Peers, config.WalDir, config.SnapDir)
+	rfNode, err := server.InitServer(config)
 	if err != nil {
 		panic(err)
 	}

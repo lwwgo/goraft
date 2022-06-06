@@ -28,6 +28,13 @@ type ResponseAppend struct {
 }
 
 func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) error {
+	defer func() {
+		if r := recover(); r != nil {
+			buff := make([]byte, 1<<10)
+			runtime.Stack(buff, false)
+			log.Printf("%v %v\n", r, string(buff))
+		}
+	}()
 	log.Printf("receive %s request from %s, local log length:%d, appendEntry length:%d, logs:%+v, req:%+v, local server logs:%+v\n",
 		req.Type.String(), req.LeaderID.Addr, len(s.Logs), len(req.Entries), req.Entries, *req, s.Logs)
 	// 接收主节点广播选举结果, 本节点主动变为从
@@ -36,9 +43,9 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 	// 如果 RPC 中的任期号比自己的小，那么 candidate 就会拒绝这次的 RPC 并且继续保持 candidate 状态
 	if req.Type == MsgHeartbeat && req.Term >= s.Term {
 		s.MuLock.Lock()
-		if s.State != Follower {
-			log.Printf("change state from %s to %s\n", s.State.String(), Follower.String())
-			s.State = Follower
+		if s.Role != Follower && s.Role != Learner {
+			log.Printf("change state from %s to %s\n", s.Role.String(), Follower.String())
+			s.Role = Follower
 			s.VotedFor = req.LeaderID
 		}
 		// 正常接收心跳, 则重置选举超时时间
@@ -46,11 +53,14 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 		// 提交本地日志, 与leader保持提交一致
 		if req.LeaderCommitted > s.CommittedIndex {
 			oldCommit := s.CommittedIndex
-			s.CommittedIndex = util.Min(uint64(len(s.Logs)-1), req.LeaderCommitted)
+			s.CommittedIndex = util.Min(s.getLastLogIndex(), req.LeaderCommitted)
+			start := s.getStartIndex()
 			for i := uint64(1); i <= s.CommittedIndex-oldCommit; i++ {
 				index := oldCommit + i
-				s.bizApplyFunc(s.Logs[index])
-				s.AppliedIndex = index
+				if index >= start {
+					s.bizApplyFunc(s.Logs[index-start])
+					s.AppliedIndex = index
+				}
 			}
 		}
 		resp.Success = true
@@ -64,7 +74,8 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 	if req.Type == MsgAppendLog {
 		// 同步日志, 一致性检查保证跟随者日志和领导者日志相同(已提交日志)
 		if (req.PreLogIndex == 0 && req.LeaderCommitted == 0) ||
-			(req.PreLogIndex == s.Logs[len(s.Logs)-1].Index && req.PreLogTerm == s.Logs[req.PreLogIndex].Term) {
+			(req.PreLogIndex == s.Logs[len(s.Logs)-1].Index && req.PreLogTerm == s.Logs[req.PreLogIndex].Term) ||
+			(req.PreLogIndex == s.Snap.EndIndex && req.PreLogTerm == s.Snap.EndTerm) {
 			// 1. 写本地内存
 			s.Logs = append(s.Logs, req.Entries...)
 			// 2. 写本地wal
@@ -79,9 +90,21 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 			if s.MaybeStartSnap() {
 				s.IsSnaping = true
 				snapshot := NewSnap(s.Logs[0].Term, s.Logs[0].Index, s.Snap.WorkPath)
-				s.Snap = snapshot
 				log.Printf("start to make snapshot file:%s\n", snapshot.GetPath())
-				go snapshot.Save(s.getSnapshot())
+				// 异步构建snapshot, 并清理内存中已Apply的日志
+				go func() {
+					s.MuLock.Lock()
+					snapMeta := SnapshotMetadata{Index: s.AppliedIndex, Term: s.Logs[s.AppliedIndex-s.Logs[0].Index].Term}
+					snap := s.getSnapshot()
+					snap.Metadata = snapMeta
+					snapshot.Save(snap)
+					snapshot.EndIndex = snapMeta.Index
+					snapshot.EndTerm = snapMeta.Term
+					s.Snap = snapshot
+					s.Logs = s.Logs[snapshot.EndIndex-snapshot.StartIndex+1:]
+					s.MuLock.Unlock()
+					log.Printf("make snapshot file succ\n")
+				}()
 			}
 		} else {
 			// 清理不一致日志
@@ -193,7 +216,7 @@ func (s *Server) WriteLog(command CommandEtnry) (LogEntry, error) {
 			if err != nil {
 				log.Printf("write log replica failed to follower[%s], err:%s\n", peer.Addr, err.Error())
 			} else if responseAppend.Success {
-				if peer.State != Learner {
+				if peer.Role != Learner {
 					succ++
 				}
 				s.NextIndex[peer.Addr]++
@@ -241,7 +264,11 @@ func (s *Server) peerPreTermAndIndex(peer Peer) (uint64, uint64) {
 	if next == 0 {
 		return 0, 0
 	}
-	return s.Logs[next-1].Term, next - 1
+	start := s.getStartIndex()
+	if next <= start {
+		return s.Logs[0].Term, s.Logs[0].Index
+	}
+	return s.Logs[next-1-start].Term, next - 1
 }
 
 func (s *Server) Do(command CommandEtnry) error {
