@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"io/ioutil"
 	"log"
@@ -19,12 +20,16 @@ import (
 	"github.com/lwwgo/goraft/util"
 )
 
+// 节点角色
 type CMState int
 
+// learener 不参与投票, 也不算在quorum. 只接收 leader 的 append log 请求, 并生成 snapshot
+// learner 将本地 snapshot 通过网络 rpc 传送给 leader 和 follower
 const (
 	Follower CMState = iota
 	Candidate
 	Leader
+	Learner
 	Dead
 )
 
@@ -36,6 +41,8 @@ func (s CMState) String() string {
 		return "candidate"
 	case Leader:
 		return "leader"
+	case Learner:
+		return "learner"
 	case Dead:
 		return "dead"
 	default:
@@ -74,7 +81,8 @@ func (mt MessageType) String() string {
 }
 
 type Peer struct {
-	Addr string
+	Addr  string
+	State CMState
 }
 
 func (p Peer) Empty() bool {
@@ -129,8 +137,15 @@ type Server struct {
 
 	// 持久化存储
 	Persist *Persistence
+	// 快照处理器
+	Snap *Snapshotter
 	// 业务状态机处理回调函数
 	bizApplyFunc func(logEntry LogEntry) error
+	// 业务状态机的快照接口, 业务层实现快照数据的生成
+	getSnapshot func() *Snapshot
+	// 日志中最新apply index 和 日志开头apply index的差值达到
+	// MaxIndexSpan, 则可以做快照
+	MaxIndexSpan uint64
 
 	// ************* leader 仅有的字段 *******
 	// leader记录其他每个Server应该接受的下个日志编号
@@ -177,8 +192,17 @@ func InitServer(addr string, peerAddrs []string, walWorkPath string) (*Server, e
 		NextIndex:           make(map[string]uint64, len(peers)),
 		Persist:             NewPersistence(0, 0, walWorkPath),
 		bizApplyFunc: func(logEntry LogEntry) error {
-			log.Printf("bussines state machine apply succ")
+			log.Printf("[example] bussines state machine apply succ")
 			return nil
+		},
+		getSnapshot: func() *Snapshot {
+			log.Printf("[example] bussines state machine mirror data")
+			kvStore := map[string]int{
+				"key1": 1,
+				"key2": 2,
+			}
+			data, _ := json.Marshal(kvStore)
+			return &Snapshot{Data: data}
 		},
 	}
 	// 加载wal到内存
@@ -283,7 +307,8 @@ func (nd *Server) Elect() {
 		LastTerm:    nd.getLogTerm(),
 	}
 	for _, peer := range nd.Peers {
-		if nd.State != Candidate {
+		// learner 不参与投票
+		if nd.State != Candidate || peer.State == Learner {
 			return
 		}
 
@@ -301,7 +326,7 @@ func (nd *Server) Elect() {
 				log.Printf("vote request failed from %s, voteGranted:%v\n", peer.Addr, response.VoteGranted)
 			}
 			// 选票超过集群中节点数量的一半, 则当选
-			if nd.State != Leader && int(winCount*2) > len(nd.Peers)+1 {
+			if nd.State != Leader && int(winCount*2) > len(nd.Peers) {
 				// 成为主节点
 				nd.MuLock.Lock()
 				nd.State = Leader
@@ -316,7 +341,7 @@ func (nd *Server) Elect() {
 	}
 
 	wg.Wait()
-	if int(winCount*2) <= len(nd.Peers)+1 {
+	if int(winCount*2) <= len(nd.Peers) {
 		if nd.State == Candidate {
 			nd.MuLock.Lock()
 			if nd.State == Candidate {
@@ -418,40 +443,53 @@ func (nd *Server) RunHeartbeatTimer() {
 }
 
 // 阻塞运行, 直到节点退出
-func (nd *Server) Run() {
-	log.Printf("start to run raft\n")
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		nd.RunElectionTimer()
-	}()
+func (s *Server) Run() {
+	log.Printf("start to run raft, begin role:%s\n", s.State.String())
+	if s.State != Learner {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			s.RunElectionTimer()
+		}()
 
-	go func() {
-		defer wg.Done()
-		nd.RunHeartbeatTimer()
-		log.Printf("exist heartbeat loop\n")
-	}()
+		go func() {
+			defer wg.Done()
+			s.RunHeartbeatTimer()
+			log.Printf("exist heartbeat loop\n")
+		}()
 
-	// 测试
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(30 * time.Second)
-		log.Printf("this node is %s\n", nd.State.String())
-		if nd.State == Leader {
-			for i := 0; i < 100; i++ {
-				nd.Do(CommandEtnry{Op: "write raft log test", Size: i})
-				time.Sleep(5 * time.Second)
+		// 测试
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(30 * time.Second)
+			log.Printf("this node is %s\n", s.State.String())
+			if s.State == Leader {
+				for i := 0; i < 100; i++ {
+					s.Do(CommandEtnry{Op: "write raft log test", Size: i})
+					time.Sleep(5 * time.Second)
+				}
 			}
-		}
-	}()
-	defer func() {
-		if r := recover(); r != nil {
-			buff := make([]byte, 1<<10)
-			runtime.Stack(buff, false)
-			log.Printf("%v %v\n", r, string(buff))
-		}
-	}()
-	wg.Wait()
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				buff := make([]byte, 1<<10)
+				runtime.Stack(buff, false)
+				log.Printf("%v %v\n", r, string(buff))
+			}
+		}()
+		wg.Wait()
+	}
+}
+
+func (s *Server) MaybeStartSnap() bool {
+	if s.State != Learner {
+		return false
+	}
+
+	if len(s.Logs) == 0 {
+		return false
+	}
+	return s.AppliedIndex-s.Logs[0].Index >= s.MaxIndexSpan
 }

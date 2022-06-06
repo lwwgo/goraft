@@ -76,6 +76,11 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 
 			resp.Success = true
 			log.Printf("append log entry succ, log:%+v\n", req.Entries)
+			if s.MaybeStartSnap() {
+				snapshot := NewSnap(s.Logs[0].Term, s.Logs[0].Index, "snap")
+				log.Printf("start to make snapshot file:%s\n", snapshot.GetPath())
+				go snapshot.Save(s.getSnapshot())
+			}
 		} else {
 			// 清理不一致日志
 			s.Logs = s.Logs[:len(s.Logs)-1]
@@ -186,7 +191,9 @@ func (s *Server) WriteLog(command CommandEtnry) (LogEntry, error) {
 			if err != nil {
 				log.Printf("write log replica failed to follower[%s], err:%s\n", peer.Addr, err.Error())
 			} else if responseAppend.Success {
-				succ++
+				if peer.State != Learner {
+					succ++
+				}
 				s.NextIndex[peer.Addr]++
 				log.Printf("write log succ on dest:%s\n", peer.Addr)
 			} else if !responseAppend.Success {
@@ -206,7 +213,7 @@ func (s *Server) WriteLog(command CommandEtnry) (LogEntry, error) {
 	wg.Wait()
 
 	// 4. 复制日志成功, leader 标记日志为 [已提交]; 否则, 回滚本地内存
-	if succ*2 > len(s.Peers)+1 {
+	if succ*2 > len(s.Peers) {
 		s.MuLock.Lock()
 		s.incCommitedIndex()
 		s.MuLock.Unlock()
