@@ -146,6 +146,8 @@ type Server struct {
 	// 日志中最新apply index 和 日志开头apply index的差值达到
 	// MaxIndexSpan, 则可以做快照
 	MaxIndexSpan uint64
+	// 是否在做快照中
+	IsSnaping bool
 
 	// ************* leader 仅有的字段 *******
 	// leader记录其他每个Server应该接受的下个日志编号
@@ -172,7 +174,7 @@ type ResponseVote struct {
 	VoteGranted bool
 }
 
-func InitServer(addr string, peerAddrs []string, walWorkPath string) (*Server, error) {
+func InitServer(addr string, peerAddrs []string, walWorkPath, snapWorkPath string) (*Server, error) {
 	peers := make([]Peer, 0)
 	for _, addr := range peerAddrs {
 		peers = append(peers, Peer{Addr: addr})
@@ -191,6 +193,7 @@ func InitServer(addr string, peerAddrs []string, walWorkPath string) (*Server, e
 		TimeOutRandomFactor: 0.1,
 		NextIndex:           make(map[string]uint64, len(peers)),
 		Persist:             NewPersistence(0, 0, walWorkPath),
+		Snap:                NewSnap(0, 0, snapWorkPath),
 		bizApplyFunc: func(logEntry LogEntry) error {
 			log.Printf("[example] bussines state machine apply succ")
 			return nil
@@ -484,11 +487,7 @@ func (s *Server) Run() {
 }
 
 func (s *Server) MaybeStartSnap() bool {
-	if s.State != Learner {
-		return false
-	}
-
-	if len(s.Logs) == 0 {
+	if s.State != Learner || s.IsSnaping || len(s.Logs) == 0 {
 		return false
 	}
 	return s.AppliedIndex-s.Logs[0].Index >= s.MaxIndexSpan

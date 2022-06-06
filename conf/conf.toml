@@ -6,4 +6,4 @@ learner = "127.0.0.1:1232"
 
 walDir = "wal"
 
-snapshot = "snapshot"
+snapDir = "snapshot"

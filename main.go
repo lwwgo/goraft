@@ -13,7 +13,9 @@ import (
 type Config struct {
 	LocalID string   `toml:"localID"`
 	Peers   []string `toml:"peers"`
+	Learner string   `toml:"learner"`
 	WalDir  string   `toml:"walDir"`
+	SnapDir string   `toml:"snapDir"`
 }
 
 func main() {
@@ -49,7 +51,7 @@ func main() {
 	log.Printf("config %+v\n", config)
 
 	log.Printf("start raft clueter!\n")
-	rfNode, err := server.InitServer(config.LocalID, config.Peers, config.WalDir)
+	rfNode, err := server.InitServer(config.LocalID, config.Peers, config.WalDir, config.SnapDir)
 	if err != nil {
 		panic(err)
 	}

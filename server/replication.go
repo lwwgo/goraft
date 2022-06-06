@@ -77,7 +77,9 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 			resp.Success = true
 			log.Printf("append log entry succ, log:%+v\n", req.Entries)
 			if s.MaybeStartSnap() {
-				snapshot := NewSnap(s.Logs[0].Term, s.Logs[0].Index, "snap")
+				s.IsSnaping = true
+				snapshot := NewSnap(s.Logs[0].Term, s.Logs[0].Index, s.Snap.WorkPath)
+				s.Snap = snapshot
 				log.Printf("start to make snapshot file:%s\n", snapshot.GetPath())
 				go snapshot.Save(s.getSnapshot())
 			}
