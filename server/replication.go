@@ -41,7 +41,13 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 	// 在等待投票期间，candidate 可能会收到另一个声称自己是 leader 的服务器节点发来的 AppendEntries RPC
 	// 如果这个 leader 的任期号（包含在RPC中）不小于 candidate 当前的任期号，那么 candidate 会承认该 leader 的合法地位并回到 follower 状态
 	// 如果 RPC 中的任期号比自己的小，那么 candidate 就会拒绝这次的 RPC 并且继续保持 candidate 状态
-	if req.Type == MsgHeartbeat && req.Term >= s.Term {
+	if req.Type == MsgHeartbeat && req.Term < s.Term {
+		resp.Success = false
+		resp.Term = s.Term
+		return errors.New("term is smaller than local term, reject this heartbeat request")
+	}
+
+	if req.Type == MsgHeartbeat {
 		s.MuLock.Lock()
 		if s.Role != Follower && s.Role != Learner {
 			log.Printf("change state from %s to %s\n", s.Role.String(), Follower.String())
@@ -73,42 +79,50 @@ func (s *Server) AppendEntryHandler(req *RequestAppend, resp *ResponseAppend) er
 	resp.Success = false
 	if req.Type == MsgAppendLog {
 		// 同步日志, 一致性检查保证跟随者日志和领导者日志相同(已提交日志)
-		if (req.PreLogIndex == 0 && req.LeaderCommitted == 0) ||
-			(req.PreLogIndex == s.Logs[len(s.Logs)-1].Index && req.PreLogTerm == s.Logs[req.PreLogIndex].Term) ||
-			(req.PreLogIndex == s.Snap.EndIndex && req.PreLogTerm == s.Snap.EndTerm) {
-			// 1. 写本地内存
-			s.Logs = append(s.Logs, req.Entries...)
-			// 2. 写本地wal
-			for _, value := range req.Entries {
-				logEntry := &LogEntry{Command: value.Command, Term: value.Term, Index: value.Index}
-				s.Persist.Append(logEntry)
-			}
-			// 3. 在下一次心跳中检查leader committedIndex, 在心跳中提交历史上leader已提交的日志
+		var lastIdx, lastTerm uint64
+		if n := len(s.Logs); n > 0 {
+			lastIdx = s.Logs[n-1].Index
+			lastTerm = s.Logs[n-1].Term
+		}
+		matched := (req.PreLogIndex == 0 && req.LeaderCommitted == 0) ||
+			(req.PreLogIndex == lastIdx && req.PreLogTerm == lastTerm) ||
+			(req.PreLogIndex == s.Snap.EndIndex && req.PreLogTerm == s.Snap.EndTerm)
 
-			resp.Success = true
-			log.Printf("append log entry succ, log:%+v\n", req.Entries)
-			if s.MaybeStartSnap() {
-				s.IsSnaping = true
-				snapshot := NewSnap(s.Logs[0].Term, s.Logs[0].Index, s.Snap.WorkPath)
-				log.Printf("start to make snapshot file:%s\n", snapshot.GetPath())
-				// 异步构建snapshot, 并清理内存中已Apply的日志
-				go func() {
-					s.MuLock.Lock()
-					snapMeta := SnapshotMetadata{Index: s.AppliedIndex, Term: s.Logs[s.AppliedIndex-s.Logs[0].Index].Term}
-					snap := s.getSnapshot()
-					snap.Metadata = snapMeta
-					snapshot.Save(snap)
-					snapshot.EndIndex = snapMeta.Index
-					snapshot.EndTerm = snapMeta.Term
-					s.Snap = snapshot
-					s.Logs = s.Logs[snapshot.EndIndex-snapshot.StartIndex+1:]
-					s.MuLock.Unlock()
-					log.Printf("make snapshot file succ\n")
-				}()
-			}
-		} else {
+		if !matched {
 			// 清理不一致日志
 			s.Logs = s.Logs[:len(s.Logs)-1]
+			return errors.New("preLogIndex or preLogTerm is not match")
+		}
+
+		// 1. 写本地内存
+		s.Logs = append(s.Logs, req.Entries...)
+		// 2. 写本地wal
+		for _, value := range req.Entries {
+			logEntry := &LogEntry{Command: value.Command, Term: value.Term, Index: value.Index}
+			s.WAL.Append(logEntry)
+		}
+		// 3. 在下一次心跳中检查leader committedIndex, 在心跳中提交历史上leader已提交的日志
+
+		resp.Success = true
+		log.Printf("append log entry succ, log:%+v\n", req.Entries)
+		if s.MaybeStartSnap() {
+			s.IsSnaping = true
+			snapshot := NewSnap(s.Logs[0].Term, s.Logs[0].Index, s.Snap.WorkPath)
+			log.Printf("start to make snapshot file:%s\n", snapshot.GetPath())
+			// 异步构建snapshot, 并清理内存中已Apply的日志
+			go func() {
+				s.MuLock.Lock()
+				snapMeta := SnapshotMetadata{Index: s.AppliedIndex, Term: s.Logs[s.AppliedIndex-s.Logs[0].Index].Term}
+				snap := s.getSnapshot()
+				snap.Metadata = snapMeta
+				snapshot.Save(snap)
+				snapshot.EndIndex = snapMeta.Index
+				snapshot.EndTerm = snapMeta.Term
+				s.Snap = snapshot
+				s.Logs = s.Logs[snapshot.EndIndex-snapshot.StartIndex+1:]
+				s.MuLock.Unlock()
+				log.Printf("make snapshot file succ\n")
+			}()
 		}
 	}
 
@@ -178,7 +192,7 @@ func (s *Server) WriteLog(command CommandEtnry) (LogEntry, error) {
 	currentIndex := int64(len(s.Logs) - 1)
 	s.MuLock.Unlock()
 	// 2. 写本地wal
-	s.Persist.Append(&logEntry)
+	s.WAL.Append(&logEntry)
 
 	// 本节点已经写入, 成功数量起始值应为 1
 	succ := 1
