@@ -9,3 +9,5 @@ walDir = "wal"
 
 snapDir = "snapshot"
 maxIndexSpan = 10000
+
+logDir = "./log"

@@ -159,6 +159,7 @@ type Config struct {
 	WalDir       string   `toml:"walDir"`
 	SnapDir      string   `toml:"snapDir"`
 	MaxIndexSpan uint64   `toml:"maxIndexSpan"`
+	LogDir       string   `toml:"logDir"`
 }
 
 func InitServer(conf Config) (*Server, error) {

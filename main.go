@@ -14,21 +14,10 @@ func main() {
 	configName := flag.String("c", "conf.toml", "conf")
 	flag.Parse()
 
-	f, err := os.OpenFile("log/"+*configName+".log", os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.ModePerm)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	// 日志同时输出到终端和文件
-	multiWriter := io.MultiWriter(os.Stdout, f)
-	log.SetOutput(multiWriter)
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-
 	curPath, err := os.Getwd()
 	if err != nil {
 		return
 	}
-
 	vip := viper.New()
 	vip.AddConfigPath(curPath + "/conf")
 	vip.SetConfigName(*configName)
@@ -41,14 +30,27 @@ func main() {
 	if err := vip.Unmarshal(&config); err != nil {
 		panic(err)
 	}
-	log.Printf("config %+v\n", config)
 
-	log.Printf("start raft cluster!\n")
+	if err := os.MkdirAll(config.LogDir, os.ModePerm); err != nil {
+		panic(err)
+	}
+	f, err := os.OpenFile(config.LogDir+"/running.log", os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.ModePerm)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	// 日志同时输出到终端和文件
+	multiWriter := io.MultiWriter(os.Stdout, f)
+	log.SetOutput(multiWriter)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	defer func() {
+		log.Printf("exist raft cluster!\n")
+	}()
 	rfNode, err := server.InitServer(config)
 	if err != nil {
 		panic(err)
 	}
 	rfNode.Run()
-
-	defer log.Printf("exist raft cluster!\n")
+	log.Printf("start raft cluster!\n")
 }
