@@ -8,7 +8,7 @@ https://pkg.go.dev/github.com/lwwgo/goraft
 ## leader写流程
 1、写本地内存  
 2、写本地wal  
-3、日志并发发送给其他followeer节点  
+3、日志并发发送给其他follower节点 
 4、过半peer返回append log entry成功 =》 标记日志已提交，apply到业务状态机，调整applied index，返回给client succ；  
     过半peer返回append log entry失败/超时 =》 回滚本地内存日志，返回给client fail
 ## follower写流程

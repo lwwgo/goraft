@@ -24,7 +24,6 @@ func main() {
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
-	var config server.Config
 	curPath, err := os.Getwd()
 	if err != nil {
 		return
@@ -37,17 +36,19 @@ func main() {
 	if err := vip.ReadInConfig(); err != nil {
 		panic(err)
 	}
+
+	var config server.Config
 	if err := vip.Unmarshal(&config); err != nil {
 		panic(err)
 	}
 	log.Printf("config %+v\n", config)
 
-	log.Printf("start raft clueter!\n")
+	log.Printf("start raft cluster!\n")
 	rfNode, err := server.InitServer(config)
 	if err != nil {
 		panic(err)
 	}
 	rfNode.Run()
 
-	defer log.Printf("exist raft clueter!\n")
+	defer log.Printf("exist raft cluster!\n")
 }
