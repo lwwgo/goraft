@@ -9,15 +9,15 @@ import (
 	"path"
 )
 
-type Persistence struct {
+type WAL struct {
 	Term     uint64
 	Index    uint64
 	WorkPath string
 	FilePath string
 }
 
-func NewPersistence(term, index uint64, workPath string) *Persistence {
-	return &Persistence{
+func NewWAL(term, index uint64, workPath string) *WAL {
+	return &WAL{
 		Term:     term,
 		Index:    index,
 		WorkPath: workPath,
@@ -25,15 +25,16 @@ func NewPersistence(term, index uint64, workPath string) *Persistence {
 	}
 }
 
-func (p *Persistence) SetPath() {
+func (p *WAL) SetPath() {
 	p.FilePath = path.Join(p.WorkPath, fmt.Sprintf("%016x-%016x.wal", p.Term, p.Index))
 }
 
 // Append 在文件末尾追加写一条raft操作日志
-func (p *Persistence) Append(logEntry *LogEntry) error {
+func (p *WAL) Append(logEntry *LogEntry) error {
 	file, err := os.OpenFile(p.FilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		log.Printf("open file failed, err:%s\n", err.Error())
+		return err
 	}
 	defer file.Close()
 
@@ -46,7 +47,7 @@ func (p *Persistence) Append(logEntry *LogEntry) error {
 }
 
 // Load 加载磁盘文件到内存
-func (p *Persistence) Load(filePath string, startIndex uint64) ([]LogEntry, error) {
+func (p *WAL) Load(filePath string, startIndex uint64) ([]LogEntry, error) {
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		log.Printf("open file failed, err:%s\n", err.Error())

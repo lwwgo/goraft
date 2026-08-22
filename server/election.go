@@ -36,23 +36,31 @@ func (nd *Server) Addr() string {
 }
 
 func (nd *Server) VoteHandler(req RequestVote, resp *ResponseVote) error {
+	if nd.Role == Learner {
+		log.Printf("learner do not support vote request\n")
+		return nil
+	}
+
 	if req.Type != MsgVote {
 		log.Printf("do not support request message type, msgType:%s\n", req.Type.String())
 		return errors.New("message type not supported")
 	}
-	log.Printf("receive vote request:%+v\n", req)
 
+	log.Printf("receive vote request:%+v\n", req)
 	nd.MuLock.Lock()
 	defer nd.MuLock.Unlock()
 
 	resp.VoteGranted = false
 	LastTerm := nd.getLastLogTerm()
 	lastIndex := nd.getLastLogIndex()
-	// 接收到的任期 > 节点任期, 并且节点没有投过票或者在上一轮投票给了接收到的节点, 并且接收到的节点日志比本节点日志新
+	// 投票规则, 同时满足以下条件, 才会投票给候选节点:
+	// 1. 接收到的任期 > 节点任期
+	// 2. 节点没有投过票 或者 在上一轮投票给了接收到的节点
+	// 3. 接收的节点日志比本节点日志新
 	// Raft 通过比较两份日志中最后一条日志条目的索引值和任期号来定义谁的日志比较新
 	// 如果两份日志最后条目的任期号不同，那么任期号大的日志更新
 	// 如果两份日志最后条目的任期号相同，那么日志较长的那个更新。
-	if req.Term > nd.Term && nd.Role != Learner &&
+	if req.Term > nd.Term &&
 		(nd.VotedFor.Empty() || nd.VotedFor.Equal(req.CandidateID)) &&
 		(req.LastTerm > LastTerm || (req.LastTerm == LastTerm && req.LastIndex >= lastIndex)) {
 		log.Printf("receive vote request from %s, change state from %s to %s\n", req.CandidateID.Addr, nd.Role.String(), Follower.String())
@@ -68,6 +76,10 @@ func (nd *Server) VoteHandler(req RequestVote, resp *ResponseVote) error {
 }
 
 func (nd *Server) Elect() {
+	if nd.Role != Candidate {
+		return
+	}
+
 	var wg sync.WaitGroup
 	winCount := int64(1)
 	request := RequestVote{
@@ -79,8 +91,8 @@ func (nd *Server) Elect() {
 	}
 	for _, peer := range nd.Peers {
 		// learner 不参与投票
-		if nd.Role != Candidate || peer.Role == Learner {
-			return
+		if peer.Role == Learner {
+			continue
 		}
 
 		wg.Add(1)

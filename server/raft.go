@@ -132,8 +132,8 @@ type Server struct {
 	// 节点状态锁
 	MuLock sync.Mutex
 
-	// 持久化存储
-	Persist *Persistence
+	// WAL 日志存储
+	WAL *WAL
 	// 快照处理器
 	Snap *Snapshotter
 	// 业务状态机处理回调函数
@@ -189,7 +189,7 @@ func InitServer(conf Config) (*Server, error) {
 		TimeOut:             10 * time.Second,
 		TimeOutRandomFactor: 0.1,
 		NextIndex:           make(map[string]uint64, len(peers)),
-		Persist:             NewPersistence(0, 0, conf.WalDir),
+		WAL:                 NewWAL(0, 0, conf.WalDir),
 		Snap:                NewSnap(0, 0, conf.SnapDir),
 		bizApplyFunc: func(logEntry LogEntry) error {
 			log.Printf("[example] bussines state machine apply succ")
@@ -234,8 +234,8 @@ func InitServer(conf Config) (*Server, error) {
 	}
 
 	// 加载wal到内存
-	if isExist := util.PathIsExist(s.Persist.WorkPath); isExist {
-		files, err := ioutil.ReadDir(s.Persist.WorkPath)
+	if isExist := util.PathIsExist(s.WAL.WorkPath); isExist {
+		files, err := ioutil.ReadDir(s.WAL.WorkPath)
 		if err != nil {
 			return nil, err
 		}
@@ -243,9 +243,9 @@ func InitServer(conf Config) (*Server, error) {
 			if fileInfo.IsDir() {
 				continue
 			}
-			filepath := path.Join(s.Persist.WorkPath, fileInfo.Name())
+			filepath := path.Join(s.WAL.WorkPath, fileInfo.Name())
 			if strings.Contains(fileInfo.Name(), ".wal") {
-				logEntries, err := s.Persist.Load(filepath, s.AppliedIndex)
+				logEntries, err := s.WAL.Load(filepath, s.AppliedIndex)
 				if err != nil {
 					return nil, err
 				}
@@ -256,13 +256,13 @@ func InitServer(conf Config) (*Server, error) {
 			}
 		}
 	} else {
-		log.Printf("%s does not exist, mkdir it\n", s.Persist.WorkPath)
-		os.Mkdir(s.Persist.WorkPath, os.ModePerm)
+		log.Printf("%s does not exist, mkdir it\n", s.WAL.WorkPath)
+		os.Mkdir(s.WAL.WorkPath, os.ModePerm)
 	}
 	if len(s.Logs) > 0 {
-		s.Persist.Term = s.Logs[len(s.Logs)-1].Term
-		s.Persist.Index = s.Logs[len(s.Logs)-1].Index
-		s.Persist.SetPath()
+		s.WAL.Term = s.Logs[len(s.Logs)-1].Term
+		s.WAL.Index = s.Logs[len(s.Logs)-1].Index
+		s.WAL.SetPath()
 	}
 
 	for _, peer := range peers {
