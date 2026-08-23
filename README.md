@@ -1,37 +1,38 @@
 # goraft
 Implementing raft protocol with golang
 
-# 项目文档
+# Project Documentation
 https://pkg.go.dev/github.com/lwwgo/goraft
 
-# 关键流程
-## leader写流程
-1、写本地内存  
-2、写本地wal  
-3、日志并发发送给其他follower节点  
-4、过半peer返回append log entry成功 =》 标记日志已提交，apply到业务状态机，调整applied index，返回给client succ；  
-    过半peer返回append log entry失败/超时 =》 回滚本地内存日志，返回给client fail
+# Key Flows
+## Leader Write Flow
+1. Write to local memory
+2. Write to local WAL
+3. Send logs to other follower nodes concurrently
+4. If a majority of peers return append log entry success => mark the log as committed, apply it to the business state machine, advance the applied index, and return succ to the client;
+   If a majority of peers return append log entry failure / timeout => roll back the local in-memory log and return fail to the client.
 
-## follower写流程
-1、收到append log entry请求，进行日志一致性检查  
-2、不满足一致性检查，则删除本机最后一条日志（内存态），返回leader append命令失败  
-3、写本地内存  
-4、写本地wal  
-5、返回append log命令成功  
-6、在下一次leader 发来心跳请求中，检查leaderCommitted是否大于本节点 committedIndex，若大于本节点提交索引，则将本节点leaderCommitted位置log标记为已提交  
+## Follower Write Flow
+1. Receive the append log entry request and perform log consistency check
+2. If the consistency check fails, delete the last log on this node (in-memory) and return append command failure to the leader
+3. Write to local memory
+4. Write to local WAL
+5. Return append log command success
+6. On the next heartbeat request from the leader, check whether `leaderCommitted` is greater than this node's `committedIndex`; if so, mark the log at `leaderCommitted` on this node as committed.
 
-## leader宕机处理
-### 日志安全约束
-leader 只commit本任期内日志，但是apply所有已在本节点日志中，且未apply的日志。  
-### 第一种：leader 已commit、apply日志，并返回client succ，在下一次心跳前，leader崩溃
-新leader任期内，由于【日志安全约束】本条日志不再单独commit，但是当新任期中新日志commit时，之前的日志 顺带 被commit。但老日志未apply的还是需要apply，
-因为如果不在新leader中apply旧任期的日志，则新leader 业务状态机中会丢失已经返回给client succ的元信息，导致后面信息错乱。  
-### 第二种：leader 未commit、apply日志，也没返回client succ，在下一次心跳前，leader崩溃
-与第一种情况不同的处理地方是：此时新leader已经无法辨别老leader是否已经返回client succ，只能"委屈"client了，让client在超时时，重发命令，探测下上一个超时
-命令是否已经完成，且client命令中需要携带一个字段：命令的唯一标识(可以用分布式ID，雪花算法)，且leader 能够做幂等检查。  
-以上两种情况，都是在过半peer节点均在本地成功写入内存、写入wal下，其他情况都较为简单，不在此一一列举。
+## Leader Crash Handling
+### Log Safety Constraint
+A leader only commits logs from its current term, but applies all logs that already exist in its local log and have not been applied yet.
 
-# 参考文档
-raft简介: https://www.cnblogs.com/richaaaard/p/6351705.html  
+### Case 1: The leader has committed and applied a log, returned succ to the client, and crashed before the next heartbeat
+In the new leader's term, because of the **log safety constraint**, this old log is no longer committed on its own; instead, the previous log is committed piggybacked when a new log in the new term is committed. However, any old log that has not yet been applied still needs to be applied,
+because if the new leader does not apply logs from older terms, the new leader's business state machine would lose meta information that had already been confirmed succ to the client, leading to inconsistencies later on.
 
-raft中文论文: https://www.cnblogs.com/linbingdong/p/6442673.html  
+### Case 2: The leader has NOT committed or applied the log, has NOT returned succ to the client, and crashed before the next heartbeat
+The difference from Case 1 is that at this point the new leader can no longer tell whether the old leader already returned succ to the client. The client has to "take the hit": on timeout, it resends the command and probes whether the previous timed-out command has actually completed. In addition, each client command must carry a unique command identifier (e.g. a distributed ID such as a snowflake ID), and the leader must support idempotency checks.
+Both of the cases above assume that a majority of peer nodes have successfully written to their local memory and WAL; other scenarios are simpler and are not enumerated here.
+
+# References
+Raft introduction: https://www.cnblogs.com/richaaaard/p/6351705.html
+
+Raft paper (Chinese): https://www.cnblogs.com/linbingdong/p/6442673.html
