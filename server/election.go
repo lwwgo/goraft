@@ -112,7 +112,18 @@ func (nd *Server) Elect() {
 			if nd.Role != Leader && int(winCount*2) > len(nd.Peers) {
 				// 成为主节点
 				nd.MuLock.Lock()
+				if nd.Role == Leader {
+					// 已有其他 goroutine 当选, 不再重复处理
+					nd.MuLock.Unlock()
+					return
+				}
 				nd.Role = Leader
+				// 新 leader 把所有 follower 的 nextIndex 重置为自身最后日志 index + 1,
+				// 后续按需退回探测匹配点
+				lastIdx := nd.getLastLogIndex()
+				for _, p := range nd.Peers {
+					nd.NextIndex[p.Addr] = lastIdx + 1
+				}
 				nd.MuLock.Unlock()
 				log.Printf("server[%s] won the election, become to be leader, winCount:%d, sum:%d\n", nd.LocalID.Addr, winCount, len(nd.Peers)+1)
 

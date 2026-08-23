@@ -55,20 +55,6 @@ func RpcCallTimeout(addr, serviceMethod string, args any, reply any, timeout tim
 	}
 }
 
-func Min[T int | int64 | uint64 | float64](a, b T) T {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func Max[T int | int64 | uint64 | float64](a, b T) T {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func PathIsExist(path string) bool {
 	_, err := os.Stat(path)
 	if err != nil {

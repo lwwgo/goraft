@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/rpc"
@@ -10,6 +9,7 @@ import (
 	"path"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -163,11 +163,16 @@ type Config struct {
 }
 
 func InitServer(conf Config) (*Server, error) {
-	peers := make([]Peer, 0)
+	peers := make([]Peer, 0, len(conf.Peers)+1)
 	for _, addr := range conf.Peers {
+		// 本实现里 Peers 的语义是"集群中其他节点", conf 里如果误写了自己要剔除,
+		// 否则对自己的 self-RPC 既拿不到票/复制成功, 还会抬高多数派分母导致选不出 leader.
+		if addr == conf.LocalID {
+			continue
+		}
 		peers = append(peers, Peer{Addr: addr})
 	}
-	if len(conf.Learner) > 0 {
+	if len(conf.Learner) > 0 && conf.Learner != conf.LocalID {
 		peers = append(peers, Peer{Addr: conf.Learner, Role: Learner})
 	}
 
@@ -206,67 +211,93 @@ func InitServer(conf Config) (*Server, error) {
 		},
 		MaxIndexSpan: conf.MaxIndexSpan,
 	}
+
 	// 加载snapshot到业务状态机
-	if isExist := util.PathIsExist(s.Snap.WorkPath); isExist {
-		log.Printf("snap work path exist\n")
-		files, err := ioutil.ReadDir(s.Snap.WorkPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, fileInfo := range files {
-			if fileInfo.IsDir() {
-				continue
-			}
-			filepath := path.Join(s.Snap.WorkPath, fileInfo.Name())
-			if strings.Contains(fileInfo.Name(), ".snap") {
-				snapshot, err := s.Snap.Load(filepath)
-				if err != nil {
-					return nil, err
-				}
-				s.AppliedIndex = snapshot.Metadata.Index
-				s.Term = snapshot.Metadata.Term
-				log.Printf("reload snapshot file:%s succ, apply index:%d, term:%d\n", filepath, s.AppliedIndex, s.Term)
-			}
-		}
-	} else {
+	isExist := util.PathIsExist(s.Snap.WorkPath)
+	if !isExist {
 		log.Printf("%s does not exist, mkdir it\n", s.Snap.WorkPath)
 		os.Mkdir(s.Snap.WorkPath, os.ModePerm)
 	}
+	files, err := os.ReadDir(s.Snap.WorkPath)
+	if err != nil {
+		return nil, err
+	}
+	for _, fileInfo := range files {
+		if fileInfo.IsDir() {
+			continue
+		}
+		filepath := path.Join(s.Snap.WorkPath, fileInfo.Name())
+		if strings.Contains(fileInfo.Name(), ".snap") {
+			snapshot, err := s.Snap.Load(filepath)
+			if err != nil {
+				return nil, err
+			}
+			s.AppliedIndex = snapshot.Metadata.Index
+			s.CommittedIndex = snapshot.Metadata.Index
+			s.Term = snapshot.Metadata.Term
+			log.Printf("reload snapshot file:%s succ, apply index:%d, term:%d\n", filepath, s.AppliedIndex, s.Term)
+		}
+	}
 
 	// 加载wal到内存
-	if isExist := util.PathIsExist(s.WAL.WorkPath); isExist {
-		files, err := ioutil.ReadDir(s.WAL.WorkPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, fileInfo := range files {
-			if fileInfo.IsDir() {
-				continue
-			}
-			filepath := path.Join(s.WAL.WorkPath, fileInfo.Name())
-			if strings.Contains(fileInfo.Name(), ".wal") {
-				logEntries, err := s.WAL.Load(filepath, s.AppliedIndex)
-				if err != nil {
-					return nil, err
-				}
-				s.Logs = append(s.Logs, logEntries...)
-				log.Printf("reload wal file:%s succ, length of logs:%d\n", filepath, len(s.Logs))
-				s.Term = util.Max(s.Term, s.Logs[len(s.Logs)-1].Term)
-				os.Remove(filepath)
-			}
-		}
-	} else {
+	isExist = util.PathIsExist(s.WAL.WorkPath)
+	if !isExist {
 		log.Printf("%s does not exist, mkdir it\n", s.WAL.WorkPath)
 		os.Mkdir(s.WAL.WorkPath, os.ModePerm)
 	}
+	files, err = os.ReadDir(s.WAL.WorkPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 先把所有 wal 文件中的日志全部合并到一个 slice，不依赖文件加载顺序
+	var allEntries []LogEntry
+	for _, fileInfo := range files {
+		if fileInfo.IsDir() {
+			continue
+		}
+		filepath := path.Join(s.WAL.WorkPath, fileInfo.Name())
+		if strings.Contains(fileInfo.Name(), ".wal") {
+			logEntries, err := s.WAL.Load(filepath, s.AppliedIndex)
+			if err != nil {
+				return nil, err
+			}
+			allEntries = append(allEntries, logEntries...)
+			log.Printf("reload wal file:%s succ, length of logs:%d\n", filepath, len(logEntries))
+			os.Remove(filepath)
+		}
+	}
+
+	if len(allEntries) > 0 {
+		// 按 Index 升序排序；同 Index 下 Term 大的更权威（新任期覆盖旧）
+		sort.Slice(allEntries, func(i, j int) bool {
+			if allEntries[i].Index != allEntries[j].Index {
+				return allEntries[i].Index < allEntries[j].Index
+			}
+			return allEntries[i].Term > allEntries[j].Term
+		})
+		// 同 Index 去重：此时因为排序规则 Term 大的在前，保留第一条即可
+		unique := make([]LogEntry, 0, len(allEntries))
+		for i, e := range allEntries {
+			if i == 0 || e.Index != unique[len(unique)-1].Index {
+				unique = append(unique, e)
+			}
+		}
+		s.Logs = append(s.Logs, unique...)
+		if last := s.Logs[len(s.Logs)-1].Term; last > s.Term {
+			s.Term = last
+		}
+	}
+
 	if len(s.Logs) > 0 {
 		s.WAL.Term = s.Logs[len(s.Logs)-1].Term
 		s.WAL.Index = s.Logs[len(s.Logs)-1].Index
 		s.WAL.SetPath()
 	}
 
+	lastIdx := s.getLastLogIndex()
 	for _, peer := range peers {
-		s.NextIndex[peer.Addr] = uint64(len(s.Logs))
+		s.NextIndex[peer.Addr] = lastIdx + 1
 	}
 	log.Printf("after init server, nextIndex: %+v\n", s.NextIndex)
 

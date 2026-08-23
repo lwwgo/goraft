@@ -51,6 +51,7 @@ func (p *WAL) Load(filePath string, startIndex uint64) ([]LogEntry, error) {
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		log.Printf("open file failed, err:%s\n", err.Error())
+		return nil, err
 	}
 	defer file.Close()
 
