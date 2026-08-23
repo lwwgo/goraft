@@ -4,6 +4,110 @@ Implementing raft protocol with golang
 # Project Documentation
 https://pkg.go.dev/github.com/lwwgo/goraft
 
+# Quick Start
+
+## Prerequisites
+
+- Go 1.21+ (the project tracks a recent Go toolchain; see `go.mod` for the exact version used)
+- A Unix-like shell (bash / zsh). macOS and Linux are supported.
+
+## Makefile Targets
+
+The project ships with a `Makefile` that covers the common developer workflows:
+
+| Target       | What it does                                                                 |
+| ------------ | ---------------------------------------------------------------------------- |
+| `make build` | Compile the binary and place it under `output/bin/goraft`.                   |
+| `make lint`  | Run `golangci-lint` over the entire module. The linter is installed on first run (via `go install`) into the user's Go tool directory, so no system-wide write permissions are needed. |
+| `make test`  | Run the Go test suite (`go test -race -count=1 ./...`). If no `*_test.go` files exist yet, the command exits cleanly with an informative message. |
+| `make demo`  | Build (if needed) and then generate a runnable multi-node cluster layout under `./demo`. Each node gets its own binary (`goraft-nodeN`), config, WAL, snapshot and log directories, plus a single `start.sh` launcher. |
+| `make clean` | Remove generated artifacts: both `output/` and `demo/` are deleted. |
+
+All directories (`output/`, `demo/`) and most numeric parameters (`DEMO_NODES`, `DEMO_BASE_PORT`, `DEMO_WITH_LEARNER`, `BIN_NAME`) are overridable on the command line, e.g.:
+
+```bash
+make demo DEMO_NODES=5 DEMO_BASE_PORT=9000 DEMO_WITH_LEARNER=1
+```
+
+## Run a Raft Demo Cluster
+
+### 1. Generate the cluster layout
+
+```bash
+make demo
+```
+
+After it completes you will see a layout like:
+
+```
+demo/
+├── start.sh
+├── node0/  (bin/ conf/ log/ snapshot/ wal/)
+├── node1/  (bin/ conf/ log/ snapshot/ wal/)
+└── node2/  (bin/ conf/ log/ snapshot/ wal/)
+```
+
+Every node starts as a follower. A leader is elected automatically after the first election timeout (default timeout is 10s with a small jitter, so expect a leader to appear within ~11s).
+
+### 2. Start the cluster
+
+- Foreground mode (Ctrl+C stops every node):
+
+```bash
+cd demo
+./start.sh
+```
+
+- Daemon mode (nodes keep running after the script exits):
+
+```bash
+cd demo
+./start.sh -d
+# or: ./start.sh daemon
+```
+
+### 3. Check status
+
+```bash
+cd demo
+./start.sh status
+```
+
+Sample output:
+
+```
+=== goraft demo status ===
+  node0        pid=12345  port=1231  ALIVE  role=LEADER
+  node1        pid=12346  port=1232  ALIVE  role=FOLLOWER
+  node2        pid=12347  port=1233  ALIVE  role=FOLLOWER
+```
+
+The `role` is inferred from the last state-change line in each node's log (`running.log` under that node's `log/` directory).
+
+### 4. Stop the cluster
+
+- If you launched in daemon mode, or want to stop a previous run:
+
+```bash
+cd demo
+./start.sh stop
+```
+
+- If you launched in foreground mode, press `Ctrl+C` once and the script traps the signal to kill every node cleanly.
+
+### 5. Inspect logs
+
+Each node writes its own log to its private directory, so you never have to disambiguate output:
+
+```bash
+cd demo
+tail -f node0/log/running.log      # Raft runtime log for node0
+tail -f node0/log/start.stdout.log # stdout/stderr captured on launch
+```
+
+The node binaries are also copied per-node and renamed to `goraft-nodeN`,
+so `ps aux | grep goraft` directly shows which process belongs to which node.
+
 # Key Flows
 ## Leader Write Flow
 1. Write to local memory
