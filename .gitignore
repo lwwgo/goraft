@@ -1,7 +1,12 @@
 .vscode/*
-# Log for project
-log/*
-wal*
+# Runtime artifacts (ignore data files only, not source directories)
+/log/
+/wal/*.wal
+/snapshot/*.snap
+/snap/*.snap
+# Old demo/build outputs
+demo/
+output/
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -12,7 +17,5 @@ wal*
 # Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# Output of the go coverage tool
 *.out
-output
-demo
