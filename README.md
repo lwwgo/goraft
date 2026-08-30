@@ -1,142 +1,186 @@
 # goraft
-Implementing raft protocol with golang
 
-# Project Documentation
-https://pkg.go.dev/github.com/lwwgo/goraft
+`goraft` is a Raft consensus protocol library written in Go, designed to be imported directly by other Go projects. It provides core capabilities including leader election, log replication, WAL persistence, and snapshot compaction.
 
-# Quick Start
+## Features
 
-## Prerequisites
+- **Leader Election**: Randomized timeout-based election to avoid split votes
+- **Log Replication**: Leader concurrently replicates logs to followers, commits on quorum
+- **State Machine Injection**: Business layers implement the `StateMachine` interface to gain consensus guarantees
+- **WAL + Snapshot**: Write-Ahead Log for persistence, snapshots for log compaction
+- **Follower Redirect**: `GetLeader()` returns the current leader address for client redirection
+- **Zero External Dependencies**: Uses only the Go standard library
 
-- Go 1.21+ (the project tracks a recent Go toolchain; see `go.mod` for the exact version used)
-- A Unix-like shell (bash / zsh). macOS and Linux are supported.
-
-## Makefile Targets
-
-The project ships with a `Makefile` that covers the common developer workflows:
-
-| Target       | What it does                                                                 |
-| ------------ | ---------------------------------------------------------------------------- |
-| `make build` | Compile the binary and place it under `output/bin/goraft`.                   |
-| `make lint`  | Run `golangci-lint` over the entire module. The linter is installed on first run (via `go install`) into the user's Go tool directory, so no system-wide write permissions are needed. |
-| `make test`  | Run the Go test suite (`go test -race -count=1 ./...`). If no `*_test.go` files exist yet, the command exits cleanly with an informative message. |
-| `make demo`  | Build (if needed) and then generate a runnable multi-node cluster layout under `./demo`. Each node gets its own binary (`goraft-nodeN`), config, WAL, snapshot and log directories, plus a single `start.sh` launcher. |
-| `make clean` | Remove generated artifacts: both `output/` and `demo/` are deleted. |
-
-All directories (`output/`, `demo/`) and most numeric parameters (`DEMO_NODES`, `DEMO_BASE_PORT`, `DEMO_WITH_LEARNER`, `BIN_NAME`) are overridable on the command line, e.g.:
+## Installation
 
 ```bash
-make demo DEMO_NODES=5 DEMO_BASE_PORT=9000 DEMO_WITH_LEARNER=1
+go get github.com/lwwgo/goraft
 ```
 
-## Run a Raft Demo Cluster
-
-### 1. Generate the cluster layout
-
-```bash
-make demo
-```
-
-After it completes you will see a layout like:
+## Package Layout
 
 ```
-demo/
-├── start.sh
-├── node0/  (bin/ conf/ log/ snapshot/ wal/)
-├── node1/  (bin/ conf/ log/ snapshot/ wal/)
-└── node2/  (bin/ conf/ log/ snapshot/ wal/)
+goraft/
+├── types/              # Pure data types and interfaces (zero internal dependencies)
+│   └── types.go        # Config, StateMachine, CommandEntry, LogEntry, Peer, RPC messages, etc.
+├── wal/                # Write-Ahead Log persistence
+│   └── wal.go          # WAL append/load
+├── snapshot/           # Snapshot persistence
+│   └── snapshotter.go  # Snapshot save/load
+├── raft/               # Raft protocol implementation
+│   ├── raft.go         # Server struct, InitServer, RPC, lifecycle, exported API
+│   ├── election.go     # Leader election logic
+│   └── replication.go  # Log replication, heartbeat, commit, apply
+├── util/               # Utility functions (RPC helpers, etc.)
+│   └── util.go
+├── go.mod              # go 1.27, zero external dependencies
+└── README.md
 ```
 
-Every node starts as a follower. A leader is elected automatically after the first election timeout (default timeout is 10s with a small jitter, so expect a leader to appear within ~11s).
+The dependency chain is clean with no cycles: `raft → wal/snapshot → types`.
 
-### 2. Start the cluster
+## Quick Start
 
-- Foreground mode (Ctrl+C stops every node):
+### 1. Implement the StateMachine interface
 
-```bash
-cd demo
-./start.sh
+Business layers implement the `StateMachine` interface. Raft guarantees `Apply` is called in the same order on all nodes:
+
+```go
+import "github.com/lwwgo/goraft/types"
+
+type MyStateMachine struct {
+    data map[string]string
+}
+
+func (sm *MyStateMachine) Apply(op string, data []byte) error {
+    // Parse the command and mutate state deterministically
+    return nil
+}
+
+func (sm *MyStateMachine) Snapshot() ([]byte, error) {
+    // Generate a point-in-time snapshot of current state
+    return nil, nil
+}
+
+func (sm *MyStateMachine) Restore(data []byte) error {
+    // Restore state from a snapshot
+    return nil
+}
 ```
 
-- Daemon mode (nodes keep running after the script exits):
+### 2. Initialize a Raft node
 
-```bash
-cd demo
-./start.sh -d
-# or: ./start.sh daemon
+```go
+import (
+    "time"
+    "github.com/lwwgo/goraft/raft"
+    "github.com/lwwgo/goraft/types"
+)
+
+config := types.Config{
+    LocalID:         "127.0.0.1:9001",                          // This node's address
+    Peers:           []string{"127.0.0.1:9002", "127.0.0.1:9003"}, // Other cluster members
+    WalDir:          "/tmp/raft/wal",                           // WAL directory
+    SnapDir:         "/tmp/raft/snap",                          // Snapshot directory
+    MaxIndexSpan:    1000,                                      // Snapshot trigger threshold
+    StateMachine:    &MyStateMachine{...},                      // Injected state machine
+    ElectionTimeout: 3 * time.Second,                           // Election timeout
+    HeartbeatInterval: 600 * time.Millisecond,                  // Heartbeat interval (default: ElectionTimeout / 5)
+}
+
+node, err := raft.InitServer(config)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
-### 3. Check status
+### 3. Start the node
 
-```bash
-cd demo
-./start.sh status
+```go
+// Option 1: Non-blocking start (recommended; caller manages lifecycle)
+node.Start()
+
+// Option 2: Blocking run
+// node.Run()
 ```
 
-Sample output:
+### 4. Submit a consensus command
 
-```
-=== goraft demo status ===
-  node0        pid=12345  port=1231  ALIVE  role=LEADER
-  node1        pid=12346  port=1232  ALIVE  role=FOLLOWER
-  node2        pid=12347  port=1233  ALIVE  role=FOLLOWER
-```
+Only the leader can submit commands; followers receive an error:
 
-The `role` is inferred from the last state-change line in each node's log (`running.log` under that node's `log/` directory).
+```go
+if !node.IsLeader() {
+    leader := node.GetLeader()
+    // Redirect client to leader
+    return
+}
 
-### 4. Stop the cluster
-
-- If you launched in daemon mode, or want to stop a previous run:
-
-```bash
-cd demo
-./start.sh stop
-```
-
-- If you launched in foreground mode, press `Ctrl+C` once and the script traps the signal to kill every node cleanly.
-
-### 5. Inspect logs
-
-Each node writes its own log to its private directory, so you never have to disambiguate output:
-
-```bash
-cd demo
-tail -f node0/log/running.log      # Raft runtime log for node0
-tail -f node0/log/start.stdout.log # stdout/stderr captured on launch
+cmd := types.CommandEntry{
+    Op:   "set",
+    Data: []byte(`{"key":"foo","value":"bar"}`),
+}
+if err := node.Do(cmd); err != nil {
+    log.Fatal(err)
+}
 ```
 
-The node binaries are also copied per-node and renamed to `goraft-nodeN`,
-so `ps aux | grep goraft` directly shows which process belongs to which node.
+### 5. Start the Raft RPC listener
 
-# Key Flows
-## Leader Write Flow
-1. Write to local memory
-2. Write to local WAL
-3. Send logs to other follower nodes concurrently
-4. If a majority of peers return append log entry success => mark the log as committed, apply it to the business state machine, advance the applied index, and return succ to the client;
-   If a majority of peers return append log entry failure / timeout => roll back the local in-memory log and return fail to the client.
+Raft internal RPC (election, log replication) requires a TCP listener. You can either let goraft start it automatically or manage it yourself:
 
-## Follower Write Flow
-1. Receive the append log entry request and perform log consistency check
-2. If the consistency check fails, delete the last log on this node (in-memory) and return append command failure to the leader
-3. Write to local memory
-4. Write to local WAL
-5. Return append log command success
-6. On the next heartbeat request from the leader, check whether `leaderCommitted` is greater than this node's `committedIndex`; if so, mark the log at `leaderCommitted` on this node as committed.
+```go
+// Option 1: Let goraft start it automatically (simple scenarios)
+config.AutoStartRPC = true
+config.RPCAddr = "127.0.0.1:9001"
 
-## Leader Crash Handling
-### Log Safety Constraint
-A leader only commits logs from its current term, but applies all logs that already exist in its local log and have not been applied yet.
+// Option 2: Manage it yourself (recommended; can share a port with business RPC)
+node.StartRPC("127.0.0.1:9001")
+```
 
-### Case 1: The leader has committed and applied a log, returned succ to the client, and crashed before the next heartbeat
-In the new leader's term, because of the **log safety constraint**, this old log is no longer committed on its own; instead, the previous log is committed piggybacked when a new log in the new term is committed. However, any old log that has not yet been applied still needs to be applied,
-because if the new leader does not apply logs from older terms, the new leader's business state machine would lose meta information that had already been confirmed succ to the client, leading to inconsistencies later on.
+## Core API Reference
 
-### Case 2: The leader has NOT committed or applied the log, has NOT returned succ to the client, and crashed before the next heartbeat
-The difference from Case 1 is that at this point the new leader can no longer tell whether the old leader already returned succ to the client. The client has to "take the hit": on timeout, it resends the command and probes whether the previous timed-out command has actually completed. In addition, each client command must carry a unique command identifier (e.g. a distributed ID such as a snowflake ID), and the leader must support idempotency checks.
-Both of the cases above assume that a majority of peer nodes have successfully written to their local memory and WAL; other scenarios are simpler and are not enumerated here.
+### `types.Config`
 
-# References
-Raft introduction: https://www.cnblogs.com/richaaaard/p/6351705.html
+| Field | Type | Description |
+|---|---|---|
+| `LocalID` | `string` | This node's address |
+| `Peers` | `[]string` | Other cluster member addresses |
+| `IsLearner` | `bool` | Whether this node is a learner (no voting rights) |
+| `Learner` | `string` | Learner node address (if any) |
+| `WalDir` | `string` | WAL log directory |
+| `SnapDir` | `string` | Snapshot directory |
+| `MaxIndexSpan` | `uint64` | Trigger snapshot when log index gap exceeds this |
+| `StateMachine` | `StateMachine` | Business state machine implementation |
+| `Logger` | `*slog.Logger` | Structured logger; defaults to `slog.Default()` |
+| `AutoStartRPC` | `bool` | Whether to auto-start the RPC listener |
+| `RPCAddr` | `string` | RPC listen address; uses `LocalID` if empty |
+| `ElectionTimeout` | `time.Duration` | Election timeout; defaults to 10s |
+| `HeartbeatInterval` | `time.Duration` | Leader heartbeat interval; defaults to `ElectionTimeout / 5` |
 
-Raft paper (Chinese): https://www.cnblogs.com/linbingdong/p/6442673.html
+### `types.StateMachine` interface
+
+```go
+type StateMachine interface {
+    Apply(op string, data []byte) error      // Apply a committed log entry
+    Snapshot() ([]byte, error)               // Generate a state snapshot
+    Restore(data []byte) error               // Restore state from a snapshot
+}
+```
+
+### `raft.Server` exported methods
+
+| Method | Description |
+|---|---|
+| `InitServer(types.Config) (*Server, error)` | Initialize a Raft node |
+| `StartRPC(addr string) error` | Start the Raft internal RPC service |
+| `Start()` | Non-blocking start of election and heartbeat timers |
+| `Run()` | Blocking run |
+| `Do(types.CommandEntry) error` | Submit a consensus command (leader only) |
+| `IsLeader() bool` | Whether this node is the leader |
+| `GetLeader() string` | Get the current leader address |
+| `GetRole() types.CMRole` | Get current role (Follower/Candidate/Leader/Learner) |
+
+## References
+
+- Raft paper: https://raft.github.io/raft.pdf
+- Raft visualization: https://thesecretlivesofdata.com/raft/

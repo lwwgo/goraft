@@ -1,4 +1,6 @@
-package server
+// Package wal provides persistent Write-Ahead Log storage for Raft log entries.
+// It depends only on the goraft/types package, keeping the dependency graph clean.
+package wal
 
 import (
 	"encoding/json"
@@ -7,8 +9,11 @@ import (
 	"log"
 	"os"
 	"path"
+
+	"github.com/lwwgo/goraft/types"
 )
 
+// WAL is the Write-Ahead Log that persists Raft log entries to disk.
 type WAL struct {
 	Term     uint64
 	Index    uint64
@@ -16,7 +21,8 @@ type WAL struct {
 	FilePath string
 }
 
-func NewWAL(term, index uint64, workPath string) *WAL {
+// New creates a new WAL instance.
+func New(term, index uint64, workPath string) *WAL {
 	return &WAL{
 		Term:     term,
 		Index:    index,
@@ -25,12 +31,13 @@ func NewWAL(term, index uint64, workPath string) *WAL {
 	}
 }
 
+// SetPath updates FilePath based on current Term and Index.
 func (p *WAL) SetPath() {
 	p.FilePath = path.Join(p.WorkPath, fmt.Sprintf("%016x-%016x.wal", p.Term, p.Index))
 }
 
-// Append 在文件末尾追加写一条raft操作日志
-func (p *WAL) Append(logEntry *LogEntry) error {
+// Append appends a log entry to the WAL file.
+func (p *WAL) Append(logEntry *types.LogEntry) error {
 	file, err := os.OpenFile(p.FilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		log.Printf("open file failed, err:%s\n", err.Error())
@@ -46,8 +53,9 @@ func (p *WAL) Append(logEntry *LogEntry) error {
 	return nil
 }
 
-// Load 加载磁盘文件到内存
-func (p *WAL) Load(filePath string, startIndex uint64) ([]LogEntry, error) {
+// Load reads all log entries from a WAL file, returning only those
+// with index greater than startIndex.
+func (p *WAL) Load(filePath string, startIndex uint64) ([]types.LogEntry, error) {
 	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		log.Printf("open file failed, err:%s\n", err.Error())
@@ -55,9 +63,9 @@ func (p *WAL) Load(filePath string, startIndex uint64) ([]LogEntry, error) {
 	}
 	defer file.Close()
 
-	var LogEntries []LogEntry
+	var LogEntries []types.LogEntry
 	decoder := json.NewDecoder(file)
-	logEntry := &LogEntry{}
+	logEntry := &types.LogEntry{}
 	for err == nil {
 		err = decoder.Decode(logEntry)
 		if err == nil && logEntry.Index > startIndex {
