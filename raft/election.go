@@ -16,8 +16,17 @@ func (nd *Server) Addr() string {
 	return nd.LocalID.Addr
 }
 
+// getRole reads nd.Role safely under MuLock. All callers that read Role
+// outside of an already-held lock must use this to avoid data races with
+// concurrent writes (e.g. Elect(), AppendEntryHandler(), VoteHandler()).
+func (nd *Server) getRole() types.CMRole {
+	nd.MuLock.Lock()
+	defer nd.MuLock.Unlock()
+	return nd.Role
+}
+
 func (nd *Server) VoteHandler(req types.RequestVote, resp *types.ResponseVote) error {
-	if nd.Role == types.Learner {
+	if nd.getRole() == types.Learner {
 		log.Printf("learner do not support vote request\n")
 		return nil
 	}
@@ -57,7 +66,7 @@ func (nd *Server) VoteHandler(req types.RequestVote, resp *types.ResponseVote) e
 }
 
 func (nd *Server) Elect() {
-	if nd.Role != types.Candidate {
+	if nd.getRole() != types.Candidate {
 		return
 	}
 
@@ -103,7 +112,7 @@ func (nd *Server) Elect() {
 				log.Printf("vote request failed from %s, voteGranted:%v\n", peer.Addr, response.VoteGranted)
 			}
 			// Win if votes exceed half of the cluster.
-			if nd.Role != types.Leader && int(winCount*2) > len(nd.Peers) {
+			if nd.getRole() != types.Leader && int(winCount*2) > len(nd.Peers) {
 				nd.MuLock.Lock()
 				if nd.Role == types.Leader {
 					nd.MuLock.Unlock()
@@ -130,7 +139,7 @@ func (nd *Server) Elect() {
 
 	wg.Wait()
 	if int(winCount*2) <= len(nd.Peers) {
-		if nd.Role == types.Candidate {
+		if nd.getRole() == types.Candidate {
 			nd.MuLock.Lock()
 			if nd.Role == types.Candidate {
 				nd.VotedFor = types.Peer{}
@@ -154,12 +163,12 @@ func (nd *Server) RunElectionTimer() {
 
 	for {
 		<-ticker.C
-		if nd.Role == types.Leader {
+		if nd.getRole() == types.Leader {
 			continue
 		}
 
 		if time.Since(nd.ElectionTimeStart) >= nd.timeOutInternal() {
-			oldState := nd.Role
+			oldState := nd.getRole()
 			nd.MuLock.Lock()
 			nd.Role = types.Candidate
 			nd.Term++
@@ -197,7 +206,7 @@ func (s *Server) getLastLogTerm() uint64 {
 
 // SendHeartbeat sends one round of heartbeats to all followers (leader only).
 func (s *Server) SendHeartbeat() {
-	if s.Role != types.Leader {
+	if s.getRole() != types.Leader {
 		return
 	}
 
@@ -234,7 +243,7 @@ func (nd *Server) RunHeartbeatTimer() {
 	defer ticker.Stop()
 	for {
 		<-ticker.C
-		if nd.Role == types.Leader {
+		if nd.getRole() == types.Leader {
 			nd.SendHeartbeat()
 		}
 	}
