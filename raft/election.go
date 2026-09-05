@@ -61,6 +61,19 @@ func (nd *Server) Elect() {
 		return
 	}
 
+	// Single-node cluster: self-vote is sufficient, win immediately.
+	// Without this check, the election goroutine never starts (no peers to iterate)
+	// and the node stays candidate forever.
+	if len(nd.Peers) == 0 {
+		nd.MuLock.Lock()
+		nd.Role = types.Leader
+		nd.LocalID.Role = types.Leader
+		nd.leaderAddr = nd.LocalID.Addr
+		nd.MuLock.Unlock()
+		log.Printf("server[%s] won the election (single node), become to be leader\n", nd.LocalID.Addr)
+		return
+	}
+
 	var wg sync.WaitGroup
 	winCount := int64(1)
 	request := types.RequestVote{
