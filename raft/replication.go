@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"sync"
@@ -369,12 +370,12 @@ func (s *Server) peerPreTermAndIndex(peer types.Peer) (uint64, uint64) {
 func (s *Server) Do(command types.CommandEntry) error {
 	logEntry, err := s.WriteLog(command)
 	if err != nil {
-		return errors.New("write log replica failed")
+		return fmt.Errorf("write log replica failed: %w", err)
 	}
 	err = s.stateMachine.Apply(logEntry.Command.Op, logEntry.Command.Data)
 	if err != nil {
-		log.Printf("apply log to bussines state machine failed, log:%+v\n", logEntry)
-		return errors.New("apply log to bussines state machine failed")
+		log.Printf("apply log to business state machine failed, log:%+v, err:%v\n", logEntry, err)
+		return fmt.Errorf("apply log to business state machine failed: %w", err)
 	}
 	return nil
 }
